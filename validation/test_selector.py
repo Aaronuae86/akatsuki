@@ -1,12 +1,15 @@
 import ast
 from difflib import unified_diff
+from enum import Enum
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
+from types import ModuleType
 
 import pytest
+import observations
 import verify
 
 from dependencies import DependencyIndex, comparison_site, guard_edit
@@ -155,6 +158,70 @@ def test_map_edit_keeps_whole_table_readers_and_matching_values(tmp_path):
     assert index.candidates(diff).names == {PASSED, OTHER}
     files["@eager/" + tag] = {"<session>": [0]}
     assert index.candidates(diff).names == {t["id"] for t in tests}
+
+
+def test_removed_dispatch_entry_keeps_key_consumers_and_eager_fallback(tmp_path):
+    original = ("class Generator:\n    TRANSFORMS = {\n"
+                "        **Parent.TRANSFORMS,\n"
+                "        exp.Int: lambda self, e: e,\n"
+                "        exp.String: lambda self, e: e,\n    }\n")
+    updated = original.replace("        exp.Int: lambda self, e: e,\n", "")
+    source = tmp_path / SOURCE
+    source.parent.mkdir()
+    source.write_bytes(original.encode())
+    diff = apply_diff(tmp_path, patch(SOURCE, original, updated))
+    tag = "@attr/sqlglot.mod/Generator/TRANSFORMS"
+    names = [PASSED, OTHER, "whole-table"]
+    files = {SOURCE: {"<session>": [1, 2, 3]}, tag: {"whole-table": [0]},
+             tag + "/key/Int": {PASSED: [0]}, tag + "/key/String": {OTHER: [0]}}
+    index = DependencyIndex({
+        "tests": names, "files": files, "observed_attributes": True,
+        "dispatch_exports": ["Int", "String"], "dispatch_modules": ["sqlglot.mod"],
+    }, [{"id": name} for name in names])
+    assert index.candidates(diff).names == {PASSED, "whole-table"}
+    files["@eager/" + tag] = {"<session>": [0]}
+    assert index.candidates(diff).names == set(names)
+
+
+def test_added_type_key_keeps_existing_misses_and_whole_table_readers(tmp_path):
+    original = ('class Generator:\n    TYPE_MAPPING = {\n'
+                '        **Parent.TYPE_MAPPING,\n        exp.DType.INT: "INT",\n    }\n')
+    updated = original.replace('        exp.DType.INT', '        exp.DType.TEXT: "VARCHAR",\n        exp.DType.INT')
+    source = tmp_path / SOURCE
+    source.parent.mkdir()
+    source.write_bytes(original.encode())
+    diff = apply_diff(tmp_path, patch(SOURCE, original, updated))
+    names = [PASSED, OTHER, "whole-table"]
+    files = {SOURCE: {"<session>": [1, 2, 3]}, "@type-map/whole": {"whole-table": [0]},
+             "@type-map/key/TEXT": {PASSED: [0]}, "@type-map/key/INT": {OTHER: [0]}}
+    index = DependencyIndex({
+        "tests": names, "files": files, "observed_attributes": True, "map_fields": ["TYPE_MAPPING"],
+        "dtype_names": {"INT": "INT", "TEXT": "TEXT"}, "dispatch_modules": ["sqlglot.mod"],
+    }, [{"id": name} for name in names])
+    assert index.candidates(diff).names == {PASSED, "whole-table"}
+    files["@type-map/eager/key/TEXT"] = {"<session>": [0]}
+    assert index.candidates(diff).names == set(names)
+
+
+def test_type_lookup_records_both_value_and_requested_key(monkeypatch):
+    class DType(Enum):
+        INT = "INT"
+        TEXT = "TEXT"
+
+    class Generator:
+        TYPE_MAPPING = {DType.INT: "NUMBER"}
+
+    Generator.__module__ = "sqlglot.test"
+    module = ModuleType("sqlglot.expressions")
+    module.DType = DType
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    visits = {}
+    monkeypatch.setattr(observations, "CALLBACK", visits.__setitem__)
+    lookup = observations.map_getter(Generator(), "TYPE_MAPPING")
+    assert lookup(DType.INT) == "NUMBER"
+    assert lookup(DType.TEXT, "TEXT") == "TEXT"
+    assert "@type-map/key/INT" in visits and "@type-map/key/TEXT" in visits
+    assert any(path.endswith("/TYPE_MAPPING/value/'NUMBER'") for path in visits)
 
 
 def test_lambda_definition_and_invocation_have_separate_coverage(tmp_path):

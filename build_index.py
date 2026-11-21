@@ -199,6 +199,15 @@ def build(root, output):
         "scalar_fields": sorted(observations.SCALAR_FIELDS),
         "map_fields": sorted(observations.MAP_FIELDS),
         "function_calls": True,
+        "dispatch_exports": sorted(name for names in observations.DISPATCH_EXPORTS.values() for name in names),
+        "dispatch_modules": sorted(
+            name for name, module in sys.modules.copy().items()
+            if name.startswith("sqlglot.") and module is not None
+            and vars(module).get("exp") is sys.modules.get("sqlglot.expressions")
+        ),
+        "dtype_names": {
+            name: member.name for name, member in sys.modules["sqlglot.expressions"].DType.__members__.items()
+        },
     }
     index["unverified"] = [name for name in profiler.collected if not profiler.results.get(name)]
     # A file-first layout keeps runtime queries local to the changed files.

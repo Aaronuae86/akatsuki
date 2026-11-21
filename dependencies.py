@@ -21,6 +21,8 @@ IDENTITY_PAIRS = {(ast.Is, ast.Eq), (ast.IsNot, ast.NotEq)}
 ORDER = {ast.Lt: operator.lt, ast.LtE: operator.le, ast.Gt: operator.gt,
          ast.GtE: operator.ge, ast.Eq: operator.eq, ast.NotEq: operator.ne}
 UNKNOWN_OPERAND = 1 << 40
+DISPATCH_FIELD = "TRANSFORMS"
+TYPE_FIELD = "TYPE_MAPPING"
 
 
 def integer_predicate(node):
@@ -149,6 +151,63 @@ def changed_literals(old, new):
     return changed
 
 
+def deleted_dispatch_entries(old, new):
+    """Match only deleted literal entries and preserve the order of all other items."""
+    if not isinstance(old, ast.Dict) or not isinstance(new, ast.Dict) or len(old.keys) <= len(new.keys):
+        return []
+    wanted = iter(zip(new.keys, new.values))
+    current = next(wanted, None)
+    removed = []
+    for key, value in zip(old.keys, old.values):
+        if current and (
+            key is current[0] or (key is not None and current[0] is not None and shape(key) == shape(current[0]))
+        ) and shape(value) == shape(current[1]):
+            current = next(wanted, None)
+            continue
+        if not (isinstance(key, ast.Attribute) and isinstance(key.value, ast.Name) and key.value.id == "exp"):
+            return []
+        removed.append((key.attr, value))
+    return removed if current is None else []
+
+
+def dtype_literal(node):
+    path = ast.unparse(node) if isinstance(node, ast.Attribute) else ""
+    parts = path.split(".")
+    if len(parts) == 3 and parts[:2] == ["exp", "DType"]:
+        return parts[2]
+
+
+def changed_type_keys(old, new):
+    if not isinstance(old, ast.Dict) or not isinstance(new, ast.Dict):
+        return set()
+    def split(node):
+        literal = {}
+        rest = []
+        for key, value in zip(node.keys, node.values):
+            name = dtype_literal(key)
+            if not (name and isinstance(value, ast.Constant) and type(value.value) is str):
+                rest.append((shape(key) if key else "", shape(value)))
+                continue
+            if name in literal:
+                return None, None
+            literal[name] = value.value
+        return literal, rest
+    before, old_rest = split(old)
+    after, new_rest = split(new)
+    # A changed ordering around a spread can change which value wins. Limit
+    # this rule to an unchanged prefix of spreads and a suffix of literals.
+    if before is None or after is None or old_rest != new_rest:
+        return set()
+    if [name for name in before if name in after] != [name for name in after if name in before]:
+        return set()
+    for node, rest in ((old, old_rest), (new, new_rest)):
+        if any(key is not None for key in node.keys[:len(rest)]) or any(
+            key is None for key in node.keys[len(rest):]
+        ):
+            return set()
+    return {name for name in before.keys() | after.keys() if before.get(name) != after.get(name)}
+
+
 def compare_blocks(before, after, changed_functions, assignments, classes=(), scalar_fields=(), map_fields=()):
     if len(before) != len(after):
         return False
@@ -175,6 +234,15 @@ def compare_blocks(before, after, changed_functions, assignments, classes=(), sc
             if not compare_blocks(old.body, new.body, changed_functions, assignments, (*classes, old.name),
                                   scalar_fields, map_fields):
                 return False
+        elif classes and (
+            class_member(old) == class_member(new) == DISPATCH_FIELD and deleted_dispatch_entries(old.value, new.value)
+            or class_member(old) == class_member(new) == TYPE_FIELD and changed_type_keys(old.value, new.value)
+        ):
+            old_header = type(old)(**{f: getattr(old, f) for f in old._fields if f != "value"}, value=None)
+            new_header = type(new)(**{f: getattr(new, f) for f in new._fields if f != "value"}, value=None)
+            if shape(old_header) != shape(new_header):
+                return False
+            assignments.append((".".join(classes), class_member(old), old.value, new.value))
         elif classes and ((field := class_member(old)) in TRACKED_CLASS_ATTRIBUTES or (
             field in scalar_fields and isinstance(old.value, ast.Constant)
             and type(old.value.value) in (str, int, bool)
@@ -330,6 +398,9 @@ class DependencyIndex:
         self.map_fields = set(index.get("map_fields", []))
         self.call_coverage = index.get("call_coverage", False)
         self.function_calls = index.get("function_calls", False)
+        self.dispatch_exports = set(index.get("dispatch_exports", ()))
+        self.dispatch_modules = set(index.get("dispatch_modules", ()))
+        self.dtype_names = index.get("dtype_names", {})
         self.factory_paths = {key.removeprefix("@factory-definition/").rsplit("/", 1)[0]
                               for key in self.files if key.startswith("@factory-definition/")}
         self.unverified = self.names & set(index.get("unverified", ()))
@@ -395,6 +466,7 @@ class DependencyIndex:
                 return self.fallback(f"structural Python edit {path}")
             if test_module:
                 result.update(name for name in self.names if name.startswith(path + "::"))
+            isolated_assignment = len(changes) == 1 and len(assignments) == 1 and not functions
             if functions:
                 observed = {}
                 entry_lines = None
@@ -446,13 +518,50 @@ class DependencyIndex:
                         return self.fallback(f"runtime code called during collection {path}")
             for owner, field, old_value, new_value in assignments:
                 module = path.removesuffix(".py").replace("/", ".")
-                if not self.add_assignment(result, module, owner, field, old_value, new_value):
+                if not self.add_assignment(result, module, owner, field, old_value, new_value, path, isolated_assignment):
                     return self.fallback(f"unresolved class configuration {path}:{owner}.{field}")
         return Impact(result)
 
-    def add_assignment(self, result, module, owner, field, old_value, new_value):
+    def add_assignment(self, result, module, owner, field, old_value, new_value, path, isolated_assignment):
         if not self.observed_attributes:
             return False
+        if (field == TYPE_FIELD and isolated_assignment and (keys := changed_type_keys(old_value, new_value))
+            and self.dtype_names
+            and (data_shape(old_value) != data_shape(new_value)
+                 or self.files.get(f"@eager/@attr/{module}/{owner}/{field}"))):
+            if module not in self.dispatch_modules or self.files.get("@type-map/eager"):
+                return False
+            if not keys <= self.dtype_names.keys():
+                return False
+            names = {self.dtype_names[key] for key in keys}
+            if any(self.files.get("@type-map/eager/key/" + name) for name in names):
+                return False
+            if not self.add(result, self.files.get("@type-map/whole", {})):
+                return False
+            return all(self.add(result, self.files.get("@type-map/key/" + name, {})) for name in names)
+        if field == TYPE_FIELD and data_shape(old_value) != data_shape(new_value):
+            # Old coverage indices track values only and need the original keys.
+            return False
+        if field == DISPATCH_FIELD:
+            tag = f"@attr/{module}/{owner}/{field}"
+            if not isolated_assignment or module not in self.dispatch_modules or self.files.get("@eager/" + tag):
+                return False
+            for key, value in deleted_dispatch_entries(old_value, new_value):
+                if key not in self.dispatch_exports:
+                    return False
+                if isinstance(value, ast.Lambda) and not (value.args.defaults or any(value.args.kw_defaults)):
+                    pass
+                elif isinstance(value, ast.Call):
+                    location = f"{path}/{value.lineno}:{value.col_offset}"
+                    definitions = self.files.get("@factory-definition/" + location, {})
+                    pure = self.files.get("@pure-dispatch-factory/" + location, {})
+                    if not definitions or pure != definitions:
+                        return False
+                else:
+                    return False
+                if not self.add(result, self.files.get(f"{tag}/key/{key}", {})):
+                    return False
+            return self.add(result, self.files.get(tag, {}))
         keys = [field, "required_args"] if field == "arg_types" else [field]
         for key in keys:
             tag = f"@attr/{module}/{owner}/{key}"

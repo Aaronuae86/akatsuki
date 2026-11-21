@@ -12,7 +12,7 @@ import sys
 from types import FunctionType
 
 from dependencies import TRACKED_CLASS_ATTRIBUTES, class_member, integer_predicate, UNKNOWN_OPERAND
-from dependencies import guard_site
+from dependencies import DISPATCH_FIELD, TYPE_FIELD, dtype_literal, guard_site
 
 
 CALLBACK = None
@@ -32,6 +32,8 @@ ORIGINS = {}
 MAP_FIELDS = set()
 MAP_GET_NAME = "__blast_radius_observe_map_get__"
 GUARD_NAME = "__blast_radius_observe_guard__"
+DISPATCH_NAME = "__blast_radius_observe_dispatch__"
+DISPATCH_EXPORTS = {}
 
 
 def guard_value(value, site):
@@ -67,6 +69,8 @@ def factory_call(site, factory, /, *args, **kwargs):
             ORIGINS[id(code)] = (code, site)
             if CALLBACK is not None:
                 CALLBACK("@factory-definition/" + site, 0)
+                if (factory.__module__, factory.__qualname__) == ("sqlglot.dialects.dialect", "rename_func"):
+                    CALLBACK("@pure-dispatch-factory/" + site, 0)
             return value
     if CALLBACK is not None:
         CALLBACK("@factory-definition/" + site, 1)
@@ -111,14 +115,20 @@ def integer_value(value, site):
 
 
 def dynamic_get(getter, receiver, name, *default):
-    if (getter is getattr or getter is hasattr) and type(name) is str and (name in SCALAR_FIELDS or name in MAP_FIELDS):
+    if (getter is getattr or getter is hasattr) and type(name) is str and (
+        name in SCALAR_FIELDS or name in MAP_FIELDS or name == DISPATCH_FIELD
+    ):
         observe(receiver, name)
     return getter(receiver, name, *default)
 
 
-def observe(receiver, name, value_tag=None):
+def observe(receiver, name, value_tag=None, key_tag=None, safe_copy=False):
     callback = CALLBACK
     if callback is not None:
+        if name == TYPE_FIELD and not safe_copy:
+            callback("@type-map/key/" + key_tag if key_tag else "@type-map/whole", 0)
+            if LOADING:
+                callback("@type-map/eager/key/" + key_tag if key_tag else "@type-map/eager", 0)
         cls = receiver if isinstance(receiver, type) else type(receiver)
         key = (cls, name)
         found = DECLARATIONS.get(key)
@@ -134,6 +144,9 @@ def observe(receiver, name, value_tag=None):
             frame = sys._getframe(1)
             module = frame.f_globals.get("__name__")
             function = frame.f_code.co_qualname
+            if name == DISPATCH_FIELD and (module, function) == ("sqlglot.generator", "_build_dispatch"):
+                # The cache is consumed at the instrumented lookup below.
+                return receiver
             if name == "NUMERIC_ESCAPES":
                 if (module, function) in {
                     ("sqlglot.dialects.dialect", "_Dialect.__new__"),
@@ -152,10 +165,33 @@ def observe(receiver, name, value_tag=None):
                 if module == "sqlglot.expressions.core":
                     marker = 2
             for dependency in found:
-                callback(dependency if value_tag is None else dependency + "/value/" + value_tag, marker)
-                if LOADING and (name in SCALAR_FIELDS or name in MAP_FIELDS):
+                site = dependency
+                if value_tag is not None:
+                    site += "/value/" + value_tag
+                if key_tag is not None and name != TYPE_FIELD:
+                    site += "/key/" + key_tag
+                callback(site, marker)
+                if LOADING and (name in SCALAR_FIELDS or name in MAP_FIELDS or name == DISPATCH_FIELD):
                     callback("@eager/" + dependency, 0)
     return receiver
+
+
+def dispatch_get(receiver, table, key):
+    mapping = getattr(receiver, table)
+    if CALLBACK is not None:
+        if not DISPATCH_EXPORTS:
+            exp = sys.modules.get("sqlglot.expressions")
+            if exp is not None:
+                for name, value in vars(exp).items():
+                    if isinstance(value, type):
+                        DISPATCH_EXPORTS.setdefault(value, []).append(name)
+        aliases = DISPATCH_EXPORTS.get(key, ()) if isinstance(key, type) and type(mapping) is dict else ()
+        if aliases:
+            for alias in aliases:
+                observe(receiver, DISPATCH_FIELD, key_tag=alias)
+        else:
+            observe(receiver, DISPATCH_FIELD)
+    return mapping.get(key)
 
 
 def map_getter(receiver, name):
@@ -167,10 +203,12 @@ def map_getter(receiver, name):
 
     def get(*args, **kwargs):
         result = method(*args, **kwargs)
+        exp = sys.modules.get("sqlglot.expressions") if name == TYPE_FIELD else None
+        key_tag = args[0].name if exp and args and type(args[0]) is vars(exp).get("DType") else None
         if type(result) in (str, int, bool):
-            observe(receiver, name, repr(result))
+            observe(receiver, name, repr(result), key_tag=key_tag)
         else:
-            observe(receiver, name)
+            observe(receiver, name, key_tag=key_tag)
         return result
     return get
 
@@ -187,11 +225,43 @@ def numeric_lookup(table, key):
     return table.get(key)
 
 
-def wrap(node, name):
+def wrap(node, name, safe_copy=False):
     return ast.copy_location(
-        ast.Call(func=ast.Name(id=ATTRIBUTE_NAME, ctx=ast.Load()), args=[node, ast.Constant(name)], keywords=[]),
+        ast.Call(func=ast.Name(id=ATTRIBUTE_NAME, ctx=ast.Load()), args=[node, ast.Constant(name)],
+                 keywords=[ast.keyword(arg="safe_copy", value=ast.Constant(True))] if safe_copy else []),
         node,
     )
+
+
+def type_copy_source(node):
+    if isinstance(node, ast.Attribute) and node.attr == TYPE_FIELD:
+        return node
+    if not isinstance(node, ast.DictComp) or len(node.generators) != 1:
+        return None
+    loop = node.generators[0]
+    if (loop.is_async or not isinstance(loop.target, ast.Tuple) or len(loop.target.elts) != 2
+        or not isinstance(node.key, ast.Name) or not isinstance(node.value, ast.Name)
+        or not all(isinstance(name, ast.Name) for name in loop.target.elts)):
+        return None
+    key, value = loop.target.elts
+    if (key.id, value.id) != (node.key.id, node.value.id):
+        return None
+    iterator = loop.iter
+    if not (isinstance(iterator, ast.Call) and not iterator.args and not iterator.keywords
+            and isinstance(iterator.func, ast.Attribute) and iterator.func.attr == "items"
+            and isinstance(iterator.func.value, ast.Attribute) and iterator.func.value.attr == TYPE_FIELD):
+        return None
+    for condition in loop.ifs:
+        if not (isinstance(condition, ast.Compare) and len(condition.ops) == 1
+                and isinstance(condition.left, ast.Name) and condition.left.id == key.id):
+            return None
+        op, right = condition.ops[0], condition.comparators[0]
+        if isinstance(op, ast.NotEq) and dtype_literal(right):
+            continue
+        if isinstance(op, ast.NotIn) and isinstance(right, ast.Tuple) and all(dtype_literal(x) for x in right.elts):
+            continue
+        return None
+    return iterator.func.value
 
 
 def compare_operands(left, right, site, negate):
@@ -221,6 +291,15 @@ def compare_operands(left, right, site, negate):
 class Reads(ast.NodeTransformer):
     def __init__(self, path):
         self.path = path
+        self.type_copies = set()
+        self.type_tables = set()
+
+    def visit_ClassDef(self, node):
+        tables = {id(stmt.value) for stmt in node.body if class_member(stmt) == TYPE_FIELD}
+        self.type_tables.update(tables)
+        self.generic_visit(node)
+        self.type_tables.difference_update(tables)
+        return node
 
     def visit_If(self, node):
         # The collector returns the original value. Unsupported truthiness is
@@ -245,7 +324,13 @@ class Reads(ast.NodeTransformer):
         ), value)
 
     def visit_Dict(self, node):
+        copied = set()
+        if id(node) in self.type_tables:
+            copied = {id(attr) for key, value in zip(node.keys, node.values)
+                      if key is None and (attr := type_copy_source(value)) is not None}
+        self.type_copies.update(copied)
         self.generic_visit(node)
+        self.type_copies.difference_update(copied)
         for call in node.values:
             if (isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
                 and any(call.func.id == name for _, name in FACTORIES)
@@ -289,11 +374,28 @@ class Reads(ast.NodeTransformer):
         self.generic_visit(node)
         if isinstance(node.ctx, ast.Load) and (
             node.attr in TRACKED_CLASS_ATTRIBUTES or node.attr in SCALAR_FIELDS or node.attr in MAP_FIELDS
+            or node.attr == DISPATCH_FIELD
         ):
-            node.value = wrap(node.value, node.attr)
+            node.value = wrap(node.value, node.attr, safe_copy=id(node) in self.type_copies)
         return node
 
     def visit_Call(self, node):
+        if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Attribute):
+            field = node.func.value
+            if (self.path == "sqlglot/generator.py" and node.func.attr == "get"
+                and field.attr in ("_dispatch", DISPATCH_FIELD) and len(node.args) == 1 and not node.keywords):
+                return ast.copy_location(ast.Call(
+                    func=ast.Name(id=DISPATCH_NAME, ctx=ast.Load()),
+                    args=[self.visit(field.value), ast.Constant(field.attr), self.visit(node.args[0])],
+                    keywords=[],
+                ), node)
+            if (self.path == "sqlglot/dialects/dialect.py" and node.func.attr == "pop"
+                and field.attr == DISPATCH_FIELD and len(node.args) == 2
+                and isinstance(node.args[1], ast.Constant) and node.args[1].value is None):
+                # Dialect registration removes unsupported JSON path parts without using the result.
+                field.value = self.visit(field.value)
+                node.args = [self.visit(arg) for arg in node.args]
+                return node
         if (isinstance(node.func, ast.Attribute) and node.func.attr == "get"
             and isinstance(node.func.value, ast.Attribute) and node.func.value.attr in MAP_FIELDS):
             field = node.func.value
@@ -326,7 +428,7 @@ class Reads(ast.NodeTransformer):
             and len(node.args) >= 2 and isinstance(node.args[1], ast.Constant)
             and isinstance(node.args[1].value, str)
             and (node.args[1].value in TRACKED_CLASS_ATTRIBUTES or node.args[1].value in SCALAR_FIELDS
-                 or node.args[1].value in MAP_FIELDS)
+                 or node.args[1].value in MAP_FIELDS or node.args[1].value == DISPATCH_FIELD)
         ):
             node.args[0] = wrap(node.args[0], node.args[1].value)
         return node
@@ -387,4 +489,5 @@ def install(root):
         setattr(builtins, FACTORY_NAME, factory_call)
         setattr(builtins, MAP_GET_NAME, map_getter)
         setattr(builtins, GUARD_NAME, guard_value)
+        setattr(builtins, DISPATCH_NAME, dispatch_get)
     os.environ["BLAST_PROFILE_SOURCE"] = str(root)

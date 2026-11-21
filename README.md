@@ -31,6 +31,10 @@ and emits one JSON line per commit.
    when their recorded observations show that evaluation stopped before the
    change. For an edit confined to one arm of an unchanged `if`, use coverage
    at the first statement when it is an unconditional call.
+   Literal dispatch-table edits use observed expression or type keys, including
+   type lookups that use the default for a missing key. For type mappings,
+   ordinary copies into derived tables preserve the key dependency. Whole-table
+   uses and unresolved import-time reads retain broader coverage.
 3. Choose the worker count by makespan plus 2,000 ms per nonempty worker.
    Try all potentially better worker counts with longest-first assignment
    and bounded moves and swaps.
@@ -84,6 +88,10 @@ hidden batch is unknown.
 
 The selector and verifier regression tests use Python 3.13 and the supplied
 dependency lock. Run them from this directory.
+
+`validation/corpus.py` freezes independent development and holdout mutations,
+then labels them by running the complete upstream suite. `validation/audit.py`
+compares local selector output with schedules for the known failing tests.
 
 ```sh
 python -m pip install -r requirements.lock
