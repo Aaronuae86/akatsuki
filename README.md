@@ -27,6 +27,10 @@ and emits one JSON line per commit.
    tests with changed or unknown comparison results. If a new local variable
    changes a function's lexical bindings, include callers and tests executing
    nested code. Use whole-suite fallback for unresolved import-time dependencies.
+   For a change after an unchanged short-circuit condition, exclude tests only
+   when their recorded observations show that evaluation stopped before the
+   change. For an edit confined to one arm of an unchanged `if`, use coverage
+   at the first statement when it is an unconditional call.
 3. Choose the worker count by makespan plus 2,000 ms per nonempty worker.
    Try all potentially better worker counts with longest-first assignment
    and bounded moves and swaps.
@@ -67,6 +71,16 @@ known weaknesses in the previous policy. The hidden batch composition is
 unknown. Full pytest runs provide the mutation labels. They stay on the
 validation host. Use `validation/holdout.py --case NAME --export DIR` to
 generate labels and `validation/mixed_batch.py` to assemble the comparison.
+
+The revision at `eceb40b048cc` scored 317.4 seconds with zero misses in
+official practice. The added guard analysis reduced two independently labeled
+parser changes from 73.634 to 10.908 simulated seconds and retained all seven
+failing tests across those changes. Generate the labels with the
+`table-sample-guard` and `table-sample-block` cases in
+`validation/holdout.py`. The 41-patch validation batch retained its previous
+137.798 simulated seconds and zero misses. The guard cases measure the
+improvement on that edit pattern. The frequency of those edits in the
+hidden batch is unknown.
 
 The selector and verifier regression tests use Python 3.13 and the supplied
 dependency lock. Run them from this directory.

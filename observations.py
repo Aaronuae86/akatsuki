@@ -12,6 +12,7 @@ import sys
 from types import FunctionType
 
 from dependencies import TRACKED_CLASS_ATTRIBUTES, class_member, integer_predicate, UNKNOWN_OPERAND
+from dependencies import guard_site
 
 
 CALLBACK = None
@@ -30,6 +31,15 @@ FACTORIES = set()
 ORIGINS = {}
 MAP_FIELDS = set()
 MAP_GET_NAME = "__blast_radius_observe_map_get__"
+GUARD_NAME = "__blast_radius_observe_guard__"
+
+
+def guard_value(value, site):
+    if CALLBACK is not None:
+        # Leave user-defined truthiness to the original Python instruction.
+        marker = int(bool(value)) if type(value) in (bool, int, str, bytes, type(None)) else 2
+        CALLBACK(site, marker)
+    return value
 
 
 def simple_factory(node):
@@ -212,6 +222,28 @@ class Reads(ast.NodeTransformer):
     def __init__(self, path):
         self.path = path
 
+    def visit_If(self, node):
+        # The collector returns the original value. Unsupported truthiness is
+        # recorded as unknown, without calling __bool__ or __len__ ourselves.
+        self.generic_visit(node)
+        if isinstance(node.test, ast.BoolOp):
+            node.test.values = [self.wrap_guard(value) for value in node.test.values]
+        else:
+            node.test = self.wrap_guard(node.test)
+        return node
+
+    visit_While = visit_If
+    visit_IfExp = visit_If
+
+    def wrap_guard(self, value):
+        if (isinstance(value, (ast.BoolOp, ast.IfExp))
+            or (isinstance(value, ast.Compare) and len(value.ops) > 1)):
+            return value
+        return ast.copy_location(ast.Call(
+            func=ast.Name(id=GUARD_NAME, ctx=ast.Load()),
+            args=[value, ast.Constant(guard_site(self.path, value))], keywords=[],
+        ), value)
+
     def visit_Dict(self, node):
         self.generic_visit(node)
         for call in node.values:
@@ -354,4 +386,5 @@ def install(root):
         setattr(builtins, GETATTR_NAME, dynamic_get)
         setattr(builtins, FACTORY_NAME, factory_call)
         setattr(builtins, MAP_GET_NAME, map_getter)
+        setattr(builtins, GUARD_NAME, guard_value)
     os.environ["BLAST_PROFILE_SOURCE"] = str(root)

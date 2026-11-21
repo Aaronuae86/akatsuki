@@ -51,7 +51,17 @@ def blind_mutation(source, family):
                     if old.isascii() and rhs.lineno == rhs.end_lineno and text.count(old) == 1:
                         new = old[:rhs.col_offset] + str(rhs.value + 1) + old[rhs.end_col_offset:]
                         candidates.append((path.relative_to(source).as_posix(), old, new))
-    return Random(20261121).choice(candidates)
+            elif family.startswith("blind-guard-") and isinstance(node, ast.If):
+                test = node.test
+                if test.lineno == test.end_lineno and not isinstance(test, ast.BoolOp):
+                    old = lines[test.lineno - 1]
+                    if (old.isascii() and old.lstrip().startswith("if ") and old.rstrip().endswith(":")
+                        and text.count(old) == 1):
+                        suffix = " and False" if family.endswith("-and") else " or True"
+                        new = old[:test.end_col_offset] + suffix + old[test.end_col_offset:]
+                        if ast.dump(ast.parse(old.lstrip() + "    pass\n").body[0].test) == ast.dump(test):
+                            candidates.append((path.relative_to(source).as_posix(), old, new))
+    return Random(family if family.startswith("blind-guard-") else 20261121).choice(candidates)
 
 
 def run(source, inventory, verify, case=None, export=None):
@@ -74,6 +84,11 @@ def run(source, inventory, verify, case=None, export=None):
     }
     if case:
         extra = {
+            "table-sample-guard": ("sqlglot/parser.py", "if self.dialect.ALIAS_POST_TABLESAMPLE:",
+                                   "if self.dialect.ALIAS_POST_TABLESAMPLE and False:"),
+            "table-sample-block": ("sqlglot/parser.py", '            this.set("sample", self._parse_table_sample())\n            if (',
+                                   '            this.set("sample", self._parse_table_sample())\n'
+                                   '            this.set("sample", None)\n            if ('),
             "new-scalar": ("sqlglot/dialects/dremio.py", "SUPPORTS_USER_DEFINED_TYPES = False",
                            "SUPPORTS_USER_DEFINED_TYPES = True"),
             "sort-order": ("sqlglot/dialects/dremio.py", 'NULL_ORDERING = "nulls_are_last"',
@@ -125,12 +140,11 @@ def run(source, inventory, verify, case=None, export=None):
                     if result.returncode or not report.is_file():
                         raise RuntimeError(f"full suite did not finish for {name}\n{result.stderr}")
                     status = json.loads(report.read_text())
-                    if name == "collection-failure":
-                        assert status["collection_error"], status
-                        assert results[name] == set(names.values())
+                    if status["collection_error"]:
+                        assert results[name] == set(names.values()), (name, status)
                         print(f"{name}: full test inventory retained for collection error", flush=True)
                     else:
-                        assert not status["collection_error"] and status["status"] in (0, 1), status
+                        assert name != "collection-failure" and status["status"] in (0, 1), status
                         failing = set(names) - set(status["passed"])
                         if case is None:
                             assert failing, f"mutation {name} did not break a test"

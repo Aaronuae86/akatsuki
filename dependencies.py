@@ -242,6 +242,65 @@ def comparison_site(old, new):
     return None
 
 
+def guard_site(path, node):
+    return f"@guard/{path}/{node.lineno}:{node.col_offset}"
+
+
+@dataclass(frozen=True)
+class GuardEdit:
+    anchor: ast.expr
+    unchanged: int
+    entry_lines: range | None = None
+
+
+def guard_edit(old, new):
+    """Find an unchanged condition that must allow an edit to execute."""
+    changes = []
+
+    def same_statements(left, right):
+        return len(left) == len(right) and all(shape(x) == shape(y) for x, y in zip(left, right))
+
+    def match(a, b):
+        if type(a) is not type(b):
+            return False
+        if isinstance(a, ast.If) and shape(a.test) == shape(b.test) and not isinstance(a.test, ast.BoolOp):
+            changed_body = not same_statements(a.body, b.body)
+            changed_else = not same_statements(a.orelse, b.orelse)
+            if changed_body != changed_else:
+                branch = a.body if changed_body else a.orelse
+                first = branch[0] if branch else None
+                # An expression statement that calls a function always has
+                # executable code at branch entry, even with a multiline call.
+                entry = (range(first.lineno, first.end_lineno + 1)
+                         if isinstance(first, ast.Expr) and isinstance(first.value, ast.Call) else None)
+                changes.append(GuardEdit(a.test, 0 if changed_body else 1, entry))
+                return True
+        if isinstance(a, (ast.If, ast.While, ast.IfExp)) and shape(a.test) != shape(b.test):
+            before, after = a.test, b.test
+            left = before.op if isinstance(before, ast.BoolOp) else None
+            right = after.op if isinstance(after, ast.BoolOp) else None
+            if (left or right) and (not left or not right or type(left) is type(right)):
+                before_parts = before.values if left else [before]
+                after_parts = after.values if right else [after]
+                anchor = None
+                for x, y in zip(before_parts, after_parts):
+                    if shape(x) != shape(y):
+                        break
+                    anchor = x
+                if anchor is not None and not isinstance(anchor, (ast.BoolOp, ast.IfExp)):
+                    changes.append(GuardEdit(anchor, 0 if isinstance(left or right, ast.And) else 1))
+                    return all(match(getattr(a, field), getattr(b, field))
+                               for field in a._fields if field != "test")
+        if isinstance(a, ast.AST):
+            return all(match(getattr(a, field), getattr(b, field)) for field in a._fields)
+        if isinstance(a, list):
+            return len(a) == len(b) and all(match(x, y) for x, y in zip(a, b))
+        return a == b
+
+    if match(old, new) and len(changes) == 1:
+        return changes[0]
+
+
 def code_ranges(change, old, new):
     if isinstance(old, ast.Lambda):
         return range(old.body.lineno, old.body.end_lineno + 1)
@@ -338,6 +397,7 @@ class DependencyIndex:
                 result.update(name for name in self.names if name.startswith(path + "::"))
             if functions:
                 observed = {}
+                entry_lines = None
                 if len(changes) == 1 and not assignments:
                     site = comparison_site(old, new)
                     if site:
@@ -349,6 +409,12 @@ class DependencyIndex:
                             scope: [0] for scope, values in self.files.get(tag, {}).items()
                             if values and UNKNOWN_OPERAND not in values
                             and all(op1(v, value1) == op2(v, value2) for v in values)
+                        }
+                    elif edit := guard_edit(old, new):
+                        entry_lines = edit.entry_lines
+                        observed = {
+                            scope: [0] for scope, values in self.files.get(guard_site(path, edit.anchor), {}).items()
+                            if values == [edit.unchanged]
                         }
                 previous = symtable.symtable(change.original, path, "exec")
                 patched = symtable.symtable(change.updated, path, "exec")
@@ -376,7 +442,7 @@ class DependencyIndex:
                         calls = self.files.get(f"@lambda/{path}", {})
                         if not self.add(result, calls, {before.lineno}):
                             return self.fallback(f"lambda executed during collection {path}")
-                    elif not self.add(result, scope, code_ranges(change, before, after)):
+                    elif not self.add(result, scope, entry_lines or code_ranges(change, before, after)):
                         return self.fallback(f"runtime code called during collection {path}")
             for owner, field, old_value, new_value in assignments:
                 module = path.removesuffix(".py").replace("/", ".")

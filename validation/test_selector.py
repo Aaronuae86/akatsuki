@@ -9,7 +9,8 @@ import sys
 import pytest
 import verify
 
-from dependencies import DependencyIndex, comparison_site
+from dependencies import DependencyIndex, comparison_site, guard_edit
+from observations import GUARD_NAME, Reads, guard_value
 from patches import apply_diff
 from schedule import cost, pack
 
@@ -84,6 +85,59 @@ def test_integer_observations_keep_changed_and_unknown_operands(tmp_path):
                   f"@int/{SOURCE}/2:11": {PASSED: [1, 9], OTHER: [3], "unknown": [UNKNOWN_OPERAND]}},
     }, tests)
     assert index.candidates(diff).names == {OTHER, "unknown"}
+
+
+@pytest.mark.parametrize(("operator", "marker"), [("and", 0), ("or", 1)])
+def test_guard_excludes_only_scopes_with_a_proven_short_circuit(tmp_path, operator, marker):
+    original = "def f(x):\n    if x:\n        return 1\n    return 0\n"
+    edited = original.replace("if x:", f"if x {operator} extra():")
+    before, after = ast.parse(original), ast.parse(edited)
+    assert guard_edit(before, after).unchanged == marker
+    assert guard_edit(after, before).unchanged == marker
+    assert guard_edit(after, ast.parse(edited.replace("extra()", "other()"))).unchanged == marker
+    assert guard_edit(before, ast.parse(edited.replace("return 0", "return 2"))) is None
+    source = tmp_path / SOURCE
+    source.parent.mkdir()
+    source.write_bytes(original.encode())
+    diff = apply_diff(tmp_path, patch(SOURCE, original, edited))
+    names = (PASSED, OTHER, "unknown", "mixed", "unobserved", "source-reader")
+    index = DependencyIndex({
+        "tests": names,
+        "files": {
+            SOURCE: {name: [2] if name != "source-reader" else [0, 2] for name in names},
+            f"@guard/{SOURCE}/2:7": {
+                PASSED: [marker], OTHER: [1 - marker], "unknown": [2], "mixed": [0, 1],
+                "source-reader": [marker],
+            },
+        },
+    }, [{"id": name} for name in names])
+    assert index.candidates(diff).names == set(names) - {PASSED}
+
+
+def test_appended_block_statement_uses_unchanged_guard_and_entry_coverage(tmp_path):
+    before = "def f(x):\n    if x:\n        g(\n            x\n        )\n    return 0\n"
+    after = before.replace("    return 0", "        h()\n    return 0")
+    edit = guard_edit(ast.parse(before), ast.parse(after))
+    assert isinstance(edit.anchor, ast.Name) and edit.anchor.id == "x" and edit.unchanged == 0
+    assert impact(tmp_path, before, after, {PASSED: [2, 6], OTHER: [2, 4, 6]}).names == {OTHER}
+
+
+def test_instrumented_nested_guard_preserves_custom_truthiness():
+    class Truth:
+        calls = 0
+
+        def __bool__(self):
+            self.calls += 1
+            return True
+
+    code = "def f(x):\n    if (x or False) and True:\n        return True\n"
+    original, instrumented = {}, {GUARD_NAME: guard_value}
+    exec(compile(code, SOURCE, "exec"), original)
+    tree = Reads(SOURCE).visit(ast.parse(code))
+    exec(compile(ast.fix_missing_locations(tree), SOURCE, "exec"), instrumented)
+    a, b = Truth(), Truth()
+    assert original["f"](a) == instrumented["f"](b)
+    assert a.calls == b.calls == 1
 
 
 def test_map_edit_keeps_whole_table_readers_and_matching_values(tmp_path):
