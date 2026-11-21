@@ -41,6 +41,53 @@ def impact(tmp_path, before, after, dependencies):
     return index.candidates(diff)
 
 
+def test_tuple_boundary_uses_exact_operands(tmp_path):
+    before = "def f(version):\n    return version < (23, 12)\n"
+    after = before.replace("<", "<=")
+    tag = f"@tuple/{SOURCE}/2:11"
+    source = tmp_path / SOURCE
+    source.parent.mkdir()
+    source.write_bytes(before.encode())
+    changes = apply_diff(tmp_path, patch(SOURCE, before, after))
+    tests = [{"id": PASSED}, {"id": OTHER}]
+    files = {SOURCE: {PASSED: [2], OTHER: [2]}, tag: {PASSED: ["[23, 12]"], OTHER: ["[23, 11]", "[24]"]}}
+    index = DependencyIndex({"tests": [PASSED, OTHER], "files": files}, tests)
+    assert index.candidates(changes).names == {PASSED}
+    files[tag][OTHER].append("?")
+    assert index.candidates(changes).names == {PASSED, OTHER}
+
+
+def test_version_observations_include_default_maxsize(monkeypatch):
+    calls = {}
+    monkeypatch.setattr(observations, "CALLBACK", calls.__setitem__)
+    tag = "@tuple/sqlglot/mod.py/1:0"
+    observations.integer_value((sys.maxsize,), tag)
+    assert json.loads(calls[tag]) == [sys.maxsize]
+    observations.integer_value(("23",), tag)
+    assert calls[tag] == "?"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="pytest-timeout uses process termination on Windows")
+def test_verifier_reports_timeout_and_failed_import(tmp_path):
+    (tmp_path / "test_broken.py").write_text("raise ImportError('fixture import')\n")
+    (tmp_path / "test_checked.py").write_text(
+        "import time\ndef test_timeout():\n    time.sleep(2)\ndef test_ok():\n    pass\n",
+    )
+    report = tmp_path / "result.json"
+    names = ["test_broken.py::test_example", "test_checked.py::test_timeout", "test_checked.py::test_ok"]
+    subprocess.run(
+        [sys.executable, str(Path(verify.__file__).resolve())], cwd=tmp_path,
+        input=json.dumps({"report": str(report), "names": names, "timeout": 0.1}),
+        env={**os.environ, "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"},
+        text=True, check=True, capture_output=True,
+    )
+    data = json.loads(report.read_text())
+    assert data["failed"] == [names[1]]
+    assert data["completed"] == [names[2]]
+    assert data["failed_collectors"] == ["test_broken.py"]
+    assert data["passed"] == []
+
+
 def test_single_function_body_edit(tmp_path):
     original = "def f(x):\n    return x + 1\n\ndef g():\n    return 7\n"
     result = impact(tmp_path, original, original.replace("+ 1", "+ 2"), {PASSED: [2], OTHER: [5]})

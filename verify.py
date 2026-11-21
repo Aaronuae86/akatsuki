@@ -14,6 +14,9 @@ class Verification:
         self.names = set(names)
         self.phases = defaultdict(set)
         self.failed = set()
+        self.errors = set()
+        self.skipped = set()
+        self.failed_collectors = set()
         self.collection_error = False
 
     def pytest_collection_modifyitems(self, config, items):
@@ -25,10 +28,15 @@ class Verification:
     def pytest_collectreport(self, report):
         if report.failed:
             self.collection_error = True
+            self.failed_collectors.add(report.nodeid)
 
     def pytest_runtest_logreport(self, report):
         if report.failed or report.skipped:
             self.failed.add(report.nodeid)
+        if report.failed:
+            self.errors.add(report.nodeid)
+        if report.skipped:
+            self.skipped.add(report.nodeid)
         if report.passed and not hasattr(report, "context"):
             self.phases[report.nodeid].add(report.when)
 
@@ -52,6 +60,10 @@ def run(names, timeout):
     result = {
         "passed": checks.proven_passing() if status in (0, 1) and not checks.collection_error else [],
         "collection_error": checks.collection_error,
+        "completed": checks.proven_passing(),
+        "failed": sorted(checks.errors),
+        "skipped": sorted(checks.skipped - checks.errors),
+        "failed_collectors": sorted(checks.failed_collectors),
         "status": int(status),
         "cpu": time.process_time() - start,
     }

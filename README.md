@@ -89,14 +89,48 @@ hidden batch is unknown.
 The selector and verifier regression tests use Python 3.13 and the supplied
 dependency lock. Run them from this directory.
 
-`validation/corpus.py` freezes independent development and holdout mutations,
-then labels them by running the complete upstream suite. `validation/audit.py`
-compares local selector output with schedules for the known failing tests.
-
 ```sh
 python -m pip install -r requirements.lock
 python -m pytest -q validation
 ```
+
+### Local judge
+
+`validation/corpus.py` freezes independent development and holdout mutations,
+then labels them by running the complete upstream suite. `validation/audit.py`
+compares local selector output with schedules for the known failing tests.
+The corpus records failures reported by pytest, including per-test timeouts
+and tests in files that fail to import. Use `label --retry-unscored` to retry
+unfinished cases in smaller groups. Cases with missing outcomes remain
+unscored. Set `freeze --seed` and `--per-family` to create a fresh set before
+benchmarking a new selector.
+
+`validation/optimizer_probe.py` measures replay of the optimization stage for
+TPC-DS executor inputs. Its comparisons are diagnostic. They cover the
+optimizer output and mutated input, with the execution and DuckDB
+comparison phases outside the probe.
+
+To compare candidates locally, build the candidate image, then run the local
+judge against the last known good image and one or more labeled batches.
+
+```sh
+docker build -t blast-radius-candidate .
+python validation/judge.py --baseline blast-radius-v3-final \
+  --candidate blast-radius-candidate --batch sample \
+  --batch /validation/revision4/holdout --report local-judge.json
+```
+
+Each batch needs `tests.json`, `commits/`, and `answers.json`. The judge
+passes the patches and test inventory into the container and reads labels on
+the host. It uses the image's configured Docker command and measures total
+container CPU, including child processes. This repository's images include
+Python for the measurement wrapper. Practice mode uses three paired trials
+with a 180-second wall limit. `--mode final` uses five paired trials with a
+270-second wall limit. A rejected run or any candidate miss fails the
+command. With one batch, `--target 130` also checks the strict local score
+threshold. The failing-tests-only lower bound explains when the target is
+impossible on that batch. The official hidden cases and host CPU timings
+remain unknown.
 
 To compare selections against full pytest results on fresh mutations of the
 pinned tree, run the held-out validator in the image.

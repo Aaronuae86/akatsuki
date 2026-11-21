@@ -46,6 +46,8 @@ def attribute(path, marker):
     values = current().setdefault(path, set())
     if path.startswith("@int/") and len(values) >= 16:
         values.add(observations.UNKNOWN_OPERAND)
+    elif path.startswith("@tuple/") and len(values) >= 16:
+        values.add("?")
     else:
         values.add(marker)
 

@@ -24,9 +24,12 @@ def lower_bound(failing, durations):
 
 
 def audit(data, output):
+    return audit_stdout(data, output.read_bytes())
+
+
+def audit_stdout(data, stdout):
     tests = json.loads((data / "tests.json").read_text())["tests"]
     answers = json.loads((data / "answers.json").read_text())["commits"]
-    stdout = output.read_bytes()
     result = evaluate_run(stdout, tests, answers)
     if not result["ok"]:
         raise ValueError(f"Invalid selector output: {result}")

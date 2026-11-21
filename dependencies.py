@@ -2,6 +2,7 @@
 
 import ast
 from dataclasses import dataclass
+import json
 import symtable
 from types import CodeType
 import operator
@@ -33,6 +34,15 @@ def integer_predicate(node):
     return None
 
 
+def tuple_predicate(node):
+    if isinstance(node, ast.Compare) and len(node.ops) == 1 and type(node.ops[0]) in ORDER:
+        right = node.comparators[0]
+        if isinstance(right, ast.Tuple) and all(isinstance(item, ast.Constant) and type(item.value) is int
+                                               for item in right.elts):
+            return ORDER[type(node.ops[0])], tuple(item.value for item in right.elts)
+    return None
+
+
 def threshold_edit(before, after):
     """Recognize a single changed predicate with identical left-hand evaluation."""
     changes = []
@@ -41,8 +51,8 @@ def threshold_edit(before, after):
         if type(a) is not type(b):
             return False
         if isinstance(a, ast.Compare):
-            x, y = integer_predicate(a), integer_predicate(b)
-            if x and y and x != y and shape(a.left) == shape(b.left):
+            x, y = integer_predicate(a) or tuple_predicate(a), integer_predicate(b) or tuple_predicate(b)
+            if x and y and type(x[1]) is type(y[1]) and x != y and shape(a.left) == shape(b.left):
                 changes.append((a, x, y))
                 return True
         if isinstance(a, ast.AST):
@@ -476,11 +486,17 @@ class DependencyIndex:
                         observed = self.files.get(f"@compare/{path}/{site}", {})
                     elif edit := threshold_edit(old, new):
                         node, (op1, value1), (op2, value2) = edit
-                        tag = f"@int/{path}/{node.lineno}:{node.col_offset}"
+                        is_tuple = type(value1) is tuple
+                        kind = "tuple" if is_tuple else "int"
+                        unknown = "?" if is_tuple else UNKNOWN_OPERAND
+                        decode = json.loads if is_tuple else lambda operand: operand
+                        tag = f"@{kind}/{path}/{node.lineno}:{node.col_offset}"
+                        if is_tuple:
+                            value1, value2 = list(value1), list(value2)
                         observed = {
                             scope: [0] for scope, values in self.files.get(tag, {}).items()
-                            if values and UNKNOWN_OPERAND not in values
-                            and all(op1(v, value1) == op2(v, value2) for v in values)
+                            if values and unknown not in values
+                            and all(op1(decode(v), value1) == op2(decode(v), value2) for v in values)
                         }
                     elif edit := guard_edit(old, new):
                         entry_lines = edit.entry_lines
@@ -524,6 +540,8 @@ class DependencyIndex:
 
     def add_assignment(self, result, module, owner, field, old_value, new_value, path, isolated_assignment):
         if not self.observed_attributes:
+            return False
+        if field == "MAP_KEYS_ARE_ARBITRARY_EXPRESSIONS" and not isolated_assignment:
             return False
         if (field == TYPE_FIELD and isolated_assignment and (keys := changed_type_keys(old_value, new_value))
             and self.dtype_names

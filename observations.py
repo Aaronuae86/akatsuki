@@ -11,7 +11,7 @@ from pathlib import Path
 import sys
 from types import FunctionType
 
-from dependencies import TRACKED_CLASS_ATTRIBUTES, class_member, integer_predicate, UNKNOWN_OPERAND
+from dependencies import TRACKED_CLASS_ATTRIBUTES, class_member, integer_predicate, tuple_predicate, UNKNOWN_OPERAND
 from dependencies import DISPATCH_FIELD, TYPE_FIELD, dtype_literal, guard_site
 
 
@@ -109,7 +109,12 @@ def discover_scalars(root):
 
 def integer_value(value, site):
     if CALLBACK is not None:
-        marker = value if type(value) is int and abs(value) < UNKNOWN_OPERAND else UNKNOWN_OPERAND
+        if site.startswith("@tuple/"):
+            marker = json.dumps(value) if type(value) is tuple and len(value) <= 8 and all(
+                type(item) is int and item.bit_length() <= 63 for item in value
+            ) else "?"
+        else:
+            marker = value if type(value) is int and abs(value) < UNKNOWN_OPERAND else UNKNOWN_OPERAND
         CALLBACK(site, marker)
     return value
 
@@ -144,6 +149,21 @@ def observe(receiver, name, value_tag=None, key_tag=None, safe_copy=False):
             frame = sys._getframe(1)
             module = frame.f_globals.get("__name__")
             function = frame.f_code.co_qualname
+            if (name == "MAP_KEYS_ARE_ARBITRARY_EXPRESSIONS"
+                and (module, function) == ("sqlglot.parser", "Parser._parse_bracket")):
+                # A subclass with its own flag does not read the base value.
+                found = found[:1]
+                # At this pinned site the flag switches between False and a
+                # bounds-checked token lookup followed by a string comparison.
+                tokens, index = receiver._tokens, receiver._index
+                if type(tokens) is list and type(index) is int:
+                    offset = index - 2
+                    token = tokens[offset] if -len(tokens) <= offset < len(tokens) else None
+                    if token is None or (
+                        type(token) is frame.f_globals.get("Token") and type(token.text) is str
+                        and token.text.upper() != "MAP"
+                    ):
+                        return receiver
             if name == DISPATCH_FIELD and (module, function) == ("sqlglot.generator", "_build_dispatch"):
                 # The cache is consumed at the instrumented lookup below.
                 return receiver
@@ -343,8 +363,9 @@ class Reads(ast.NodeTransformer):
 
     def visit_Compare(self, node):
         self.generic_visit(node)
-        if integer_predicate(node):
-            site = f"@int/{self.path}/{node.lineno}:{node.col_offset}"
+        kind = "int" if integer_predicate(node) else "tuple" if tuple_predicate(node) else None
+        if kind:
+            site = f"@{kind}/{self.path}/{node.lineno}:{node.col_offset}"
             node.left = ast.copy_location(ast.Call(
                 func=ast.Name(id=INTEGER_NAME, ctx=ast.Load()),
                 args=[node.left, ast.Constant(site)], keywords=[],
