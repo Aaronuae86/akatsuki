@@ -4,6 +4,7 @@ import ast
 from dataclasses import dataclass
 import symtable
 from types import CodeType
+import operator
 import warnings
 
 
@@ -17,6 +18,39 @@ TRACKED_CLASS_ATTRIBUTES = {
     "required_args",
 }
 IDENTITY_PAIRS = {(ast.Is, ast.Eq), (ast.IsNot, ast.NotEq)}
+ORDER = {ast.Lt: operator.lt, ast.LtE: operator.le, ast.Gt: operator.gt,
+         ast.GtE: operator.ge, ast.Eq: operator.eq, ast.NotEq: operator.ne}
+UNKNOWN_OPERAND = 1 << 40
+
+
+def integer_predicate(node):
+    if isinstance(node, ast.Compare) and len(node.ops) == 1 and type(node.ops[0]) in ORDER:
+        right = node.comparators[0]
+        if isinstance(right, ast.Constant) and type(right.value) is int:
+            return ORDER[type(node.ops[0])], right.value
+    return None
+
+
+def threshold_edit(before, after):
+    """Recognize a single changed predicate with identical left-hand evaluation."""
+    changes = []
+
+    def match(a, b):
+        if type(a) is not type(b):
+            return False
+        if isinstance(a, ast.Compare):
+            x, y = integer_predicate(a), integer_predicate(b)
+            if x and y and x != y and shape(a.left) == shape(b.left):
+                changes.append((a, x, y))
+                return True
+        if isinstance(a, ast.AST):
+            return all(match(getattr(a, f), getattr(b, f)) for f in a._fields)
+        if isinstance(a, list):
+            return len(a) == len(b) and all(match(x, y) for x, y in zip(a, b))
+        return a == b
+
+    if match(before, after) and len(changes) == 1:
+        return changes[0]
 
 
 @dataclass
@@ -32,6 +66,8 @@ def tree_signature(table):
             (s.get_name(), s.is_local(), s.is_global(), s.is_nonlocal(), s.is_free(),
              s.is_parameter(), s.is_assigned(), s.is_imported())
             for s in table.get_symbols()
+            if not (s.is_global() and not s.is_declared_global() and table.get_name() != "top"
+                    and not s.is_local() and not s.is_assigned())
         ),
         [tree_signature(child) for child in table.get_children()],
     )
@@ -44,6 +80,29 @@ def code_signature(code):
 
 def shape(node):
     return ast.dump(node, include_attributes=False)
+
+
+def factory_edits(a, b, path, files, sites):
+    """Match edits confined to literal arguments of observed closure factories."""
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, ast.Call) and isinstance(a.func, ast.Name) and shape(a.func) == shape(b.func):
+        site = f"{path}/{a.lineno}:{a.col_offset}"
+        registrations = files.get("@factory-definition/" + site)
+        if registrations and all(markers == [0] for markers in registrations.values()):
+            left = a.args + [k.value for k in a.keywords]
+            right = b.args + [k.value for k in b.keywords]
+            if (len(a.args) == len(b.args) and [k.arg for k in a.keywords] == [k.arg for k in b.keywords]
+                and all(isinstance(x, ast.Constant) and isinstance(y, ast.Constant)
+                        and type(x.value) is type(y.value) for x, y in zip(left, right))):
+                if any(shape(x) != shape(y) for x, y in zip(left, right)):
+                    sites.append(site)
+                return True
+    if isinstance(a, ast.AST):
+        return all(factory_edits(getattr(a, f), getattr(b, f), path, files, sites) for f in a._fields)
+    if isinstance(a, list):
+        return len(a) == len(b) and all(factory_edits(x, y, path, files, sites) for x, y in zip(a, b))
+    return a == b
 
 
 def class_member(node):
@@ -78,7 +137,19 @@ def data_shape(node):
     return shape(node)
 
 
-def compare_blocks(before, after, changed_functions, assignments, classes=()):
+def changed_literals(old, new):
+    if not isinstance(old, ast.Dict) or not isinstance(new, ast.Dict) or data_shape(old) != data_shape(new):
+        return []
+    changed = []
+    for left, right in zip(old.values, new.values):
+        if shape(left) != shape(right):
+            if not isinstance(left, ast.Constant) or type(left.value) not in (str, int, bool):
+                return []
+            changed.append(left.value)
+    return changed
+
+
+def compare_blocks(before, after, changed_functions, assignments, classes=(), scalar_fields=(), map_fields=()):
     if len(before) != len(after):
         return False
     for old, new in zip(before, after):
@@ -101,9 +172,13 @@ def compare_blocks(before, after, changed_functions, assignments, classes=()):
                 ast.ClassDef(body=[], **{f: getattr(new, f) for f in fields})
             ):
                 return False
-            if not compare_blocks(old.body, new.body, changed_functions, assignments, (*classes, old.name)):
+            if not compare_blocks(old.body, new.body, changed_functions, assignments, (*classes, old.name),
+                                  scalar_fields, map_fields):
                 return False
-        elif classes and (field := class_member(old)) in TRACKED_CLASS_ATTRIBUTES:
+        elif classes and ((field := class_member(old)) in TRACKED_CLASS_ATTRIBUTES or (
+            field in scalar_fields and isinstance(old.value, ast.Constant)
+            and type(old.value.value) in (str, int, bool)
+        ) or (field in map_fields and changed_literals(old.value, new.value))):
             if field != class_member(new) or not old.value or not new.value:
                 return False
             if data_shape(old.value) != data_shape(new.value):
@@ -192,6 +267,12 @@ class DependencyIndex:
         self.files = index["files"]
         self.observed_attributes = index.get("observed_attributes", False)
         self.numeric_lookups = index.get("numeric_lookups", False)
+        self.scalar_fields = set(index.get("scalar_fields", []))
+        self.map_fields = set(index.get("map_fields", []))
+        self.call_coverage = index.get("call_coverage", False)
+        self.function_calls = index.get("function_calls", False)
+        self.factory_paths = {key.removeprefix("@factory-definition/").rsplit("/", 1)[0]
+                              for key in self.files if key.startswith("@factory-definition/")}
         self.unverified = self.names & set(index.get("unverified", ()))
         self.unknown = self.names - set(index["tests"])
 
@@ -227,7 +308,8 @@ class DependencyIndex:
                 if not self.add(result, dependencies):
                     return self.fallback(f"collection fixture {path}")
                 continue
-            if not path.startswith("sqlglot/") or not path.endswith(".py"):
+            test_module = path.startswith("tests/") and path.split("/")[-1].startswith("test_")
+            if not (path.startswith("sqlglot/") or test_module) or not path.endswith(".py"):
                 return self.fallback(f"test or non-Python source {path}")
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", SyntaxWarning)
@@ -244,28 +326,57 @@ class DependencyIndex:
             if not dependencies:
                 return self.fallback(f"no baseline coverage for {path}")
             functions, assignments = [], []
-            if not compare_blocks(old.body, new.body, functions, assignments):
+            if not compare_blocks(old.body, new.body, functions, assignments, scalar_fields=self.scalar_fields,
+                                  map_fields=self.map_fields):
+                sites = []
+                if (len(changes) == 1 and path in self.factory_paths
+                    and factory_edits(old, new, path, self.files, sites) and sites
+                    and all(self.add(result, self.files.get("@factory-call/" + site, {})) for site in sites)):
+                    continue
                 return self.fallback(f"structural Python edit {path}")
+            if test_module:
+                result.update(name for name in self.names if name.startswith(path + "::"))
             if functions:
                 observed = {}
                 if len(changes) == 1 and not assignments:
                     site = comparison_site(old, new)
                     if site:
                         observed = self.files.get(f"@compare/{path}/{site}", {})
+                    elif edit := threshold_edit(old, new):
+                        node, (op1, value1), (op2, value2) = edit
+                        tag = f"@int/{path}/{node.lineno}:{node.col_offset}"
+                        observed = {
+                            scope: [0] for scope, values in self.files.get(tag, {}).items()
+                            if values and UNKNOWN_OPERAND not in values
+                            and all(op1(v, value1) == op2(v, value2) for v in values)
+                        }
                 previous = symtable.symtable(change.original, path, "exec")
                 patched = symtable.symtable(change.updated, path, "exec")
                 original_code = compile(old, path, "exec", dont_inherit=True)
-                if (
-                    tree_signature(previous) != tree_signature(patched)
-                    or code_signature(original_code) != code_signature(patched_code)
-                ):
+                binding_change = tree_signature(previous) != tree_signature(patched)
+                if (code_signature(original_code) != code_signature(patched_code)
+                    or (binding_change and not self.function_calls)):
                     return self.fallback(f"changed Python bindings {path}")
                 for before, after in functions:
                     scope = {
                         scope: lines for scope, lines in dependencies.items()
                         if not (scope in observed and 2 not in observed[scope])
                     }
-                    if not self.add(result, scope, code_ranges(change, before, after)):
+                    if binding_change:
+                        # A new local can alter name lookup before the edited line.
+                        # Retain callers and all tests executing nested code in this body.
+                        first = min([before.lineno, *(n.lineno for n in getattr(before, "decorator_list", []))])
+                        calls = self.files.get("@calls/" + path, {})
+                        body = before.body if isinstance(before, ast.Lambda) else before.body[0]
+                        if (not self.add(result, calls, range(first, before.end_lineno + 1))
+                            or not self.add(result, dependencies, range(body.lineno, before.end_lineno + 1))):
+                            return self.fallback(f"changed bindings used during collection {path}")
+                    elif isinstance(before, ast.Lambda) and self.call_coverage:
+                        # Class dictionary construction and lambda calls can share a source line.
+                        calls = self.files.get(f"@lambda/{path}", {})
+                        if not self.add(result, calls, {before.lineno}):
+                            return self.fallback(f"lambda executed during collection {path}")
+                    elif not self.add(result, scope, code_ranges(change, before, after)):
                         return self.fallback(f"runtime code called during collection {path}")
             for owner, field, old_value, new_value in assignments:
                 module = path.removesuffix(".py").replace("/", ".")
@@ -279,6 +390,12 @@ class DependencyIndex:
         keys = [field, "required_args"] if field == "arg_types" else [field]
         for key in keys:
             tag = f"@attr/{module}/{owner}/{key}"
+            if self.files.get("@eager/" + tag):
+                return False
+            if field in self.map_fields:
+                for literal in changed_literals(old_value, new_value):
+                    if not self.add(result, self.files.get(tag + "/value/" + repr(literal), {})):
+                        return False
             uses = self.files.get(tag, {})
             # The tokenizer's dialect metaclass reads only the keys of the
             # numeric-escape table. The shape check above preserves all keys.

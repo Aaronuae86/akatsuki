@@ -7,6 +7,7 @@ import subprocess
 import sys
 
 import pytest
+import verify
 
 from dependencies import DependencyIndex, comparison_site
 from patches import apply_diff
@@ -16,7 +17,6 @@ from schedule import cost, pack
 SOURCE = "sqlglot/mod.py"
 PASSED = "tests/test_mod.py::test_passed"
 OTHER = "tests/test_other.py::test_other"
-ROOT = Path(__file__).resolve().parents[1]
 
 
 def patch(path, old, new):
@@ -67,6 +67,53 @@ def test_equivalence_requires_a_sole_operator_edit():
     assert comparison_site(old, ast.parse("x.a == None")) == "1:0"
     assert comparison_site(old, ast.parse("x.b == None")) is None
     assert comparison_site(old, ast.parse("x.a == None\ny()")) is None
+
+
+def test_integer_observations_keep_changed_and_unknown_operands(tmp_path):
+    from dependencies import UNKNOWN_OPERAND
+
+    original = "def f(x):\n    return x > 3\n"
+    source = tmp_path / SOURCE
+    source.parent.mkdir()
+    source.write_bytes(original.encode())
+    diff = apply_diff(tmp_path, patch(SOURCE, original, original.replace("> 3", ">= 3")))
+    tests = [{"id": name} for name in (PASSED, OTHER, "unknown")]
+    index = DependencyIndex({
+        "tests": [t["id"] for t in tests],
+        "files": {SOURCE: {t["id"]: [2] for t in tests},
+                  f"@int/{SOURCE}/2:11": {PASSED: [1, 9], OTHER: [3], "unknown": [UNKNOWN_OPERAND]}},
+    }, tests)
+    assert index.candidates(diff).names == {OTHER, "unknown"}
+
+
+def test_map_edit_keeps_whole_table_readers_and_matching_values(tmp_path):
+    original = 'class Dialect:\n    TYPE_MAPPING = {"text": "TEXT", "n": "INT"}\n'
+    source = tmp_path / SOURCE
+    source.parent.mkdir()
+    source.write_bytes(original.encode())
+    diff = apply_diff(tmp_path, patch(SOURCE, original, original.replace('"TEXT"', '"VARCHAR"')))
+    tag = "@attr/sqlglot.mod/Dialect/TYPE_MAPPING"
+    files = {SOURCE: {"<session>": [1, 2]}, tag: {PASSED: [0]},
+             tag + "/value/'TEXT'": {OTHER: [0]}, tag + "/value/'INT'": {"unaffected": [0]}}
+    tests = [{"id": name} for name in (PASSED, OTHER, "unaffected")]
+    index = DependencyIndex({"tests": [t["id"] for t in tests], "files": files,
+                             "observed_attributes": True, "map_fields": ["TYPE_MAPPING"]}, tests)
+    assert index.candidates(diff).names == {PASSED, OTHER}
+    files["@eager/" + tag] = {"<session>": [0]}
+    assert index.candidates(diff).names == {t["id"] for t in tests}
+
+
+def test_lambda_definition_and_invocation_have_separate_coverage(tmp_path):
+    original = 'class Dialect:\n    table = {"fn": lambda x: x + 1}\n'
+    source = tmp_path / SOURCE
+    source.parent.mkdir()
+    source.write_bytes(original.encode())
+    diff = apply_diff(tmp_path, patch(SOURCE, original, original.replace("+ 1", "+ 2")))
+    tests = [{"id": PASSED}, {"id": OTHER}]
+    index = DependencyIndex({"tests": [PASSED, OTHER], "call_coverage": True,
+                             "files": {SOURCE: {"<session>": [1, 2]},
+                                       "@lambda/" + SOURCE: {PASSED: [2]}}}, tests)
+    assert index.candidates(diff).names == {PASSED}
 
 
 def test_offset_hunk_uses_pinned_lines(tmp_path):
@@ -120,7 +167,7 @@ def test_verifier_keeps_subtest_and_teardown_failures(tmp_path):
         "test_report.py::TestTeardown::test_teardown_failure",
     ]
     subprocess.run(
-        [sys.executable, str(ROOT / "verify.py")], cwd=tmp_path,
+        [sys.executable, str(Path(verify.__file__).resolve())], cwd=tmp_path,
         input=json.dumps({"report": str(report), "names": names, "timeout": 10}),
         env={**os.environ, "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"},
         text=True, check=True, capture_output=True,

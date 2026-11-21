@@ -9,4 +9,5 @@
 !replay.py
 !schedule.py
 !selector.py
+!index_store.py
 !verify.py

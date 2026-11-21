@@ -9,16 +9,24 @@ and emits one JSON line per commit.
 
 1. Profile only SQLGlot at `eb11aec4be8cb2122afe713a4816662c3f0fb2fa` during the
    build. Record per-test lines, source and fixture reads, collection and
-   shared setup, and coverage from spawned process pools. Record the receiving
-   class for selected configuration attributes and the consumed numeric-escape
-   keys. Index by pytest node ID, then translate IDs using the judge's inventory.
+   shared setup, and coverage from spawned process pools. Record calls to lambdas
+   separately from execution of the line declaring them. Give each supported
+   factory-created callback a distinct code object during profiling so calls can
+   be attributed to the dictionary entry that created the callback.
+   Record class configuration reads, selected dictionary values and bounded
+   integer operands for comparisons. The selector reads the relevant index
+   entries from a read-only SQLite database and translates pytest node IDs using
+   the judge's inventory.
 2. Validate and independently apply each unified diff to the pinned source.
    Compare Python structure and lexical bindings before using baseline
    coverage. Widen for additions within an existing function and retain the
    whole suite for unsupported, invalid, or collection-sensitive changes.
    Preserve explicit source readers on equivalent ASTs. For a sole supported
    comparison edit, inspect whether identity and equality are equivalent for
-   the operand types observed at that site.
+   the operand types observed at that site. For an integer threshold edit, keep
+   tests with changed or unknown comparison results. If a new local variable
+   changes a function's lexical bindings, include callers and tests executing
+   nested code. Use whole-suite fallback for unresolved import-time dependencies.
 3. Choose the worker count by makespan plus 2,000 ms per nonempty worker.
    Try all potentially better worker counts with longest-first assignment
    and bounded moves and swaps.
@@ -46,11 +54,19 @@ adds CPU charged to its cgroup. It reports the median rounded as specified by
 the judge. It uses the sample answers on the host to check the container's
 output. See [SCORING.md](SCORING.md) for the exact rules.
 
-In local Linux/amd64 trials, the dependency policy's simulated time was
-105.935 seconds and its CPU-inclusive score was about 107 seconds, with zero
-misses on the 30 supplied patches. The rerun policy reduced simulated time
-to 94.373 seconds, but its additional CPU raised the total. That tradeoff
-determined the submission default.
+The previous entry scored 107.2 seconds on the public sample. Its official
+practice result included 385.249 simulated seconds, approximately 1.93 CPU
+seconds and zero misses. The new dependency policy targets the simulated
+cost of broad selections. On the public sample it used 105.919 simulated
+seconds with zero misses.
+
+On a diagnostic batch of 21 seeded public patches and nine fresh mutations,
+the previous and revised policies used 312.489 and 62.884 simulated seconds,
+respectively. Both covered every labeled failure. The nine mutations exercise
+known weaknesses in the previous policy. The hidden batch composition is
+unknown. Full pytest runs provide the mutation labels. They stay on the
+validation host. Use `validation/holdout.py --case NAME --export DIR` to
+generate labels and `validation/mixed_batch.py` to assemble the comparison.
 
 The selector and verifier regression tests use Python 3.13 and the supplied
 dependency lock. Run them from this directory.

@@ -8,6 +8,7 @@ import sys
 import time
 
 from dependencies import DependencyIndex
+from index_store import load_index
 from patches import apply_diff
 from replay import Replay
 from schedule import cost, pack
@@ -41,7 +42,7 @@ def main(data, source, index_path, verify, verbose):
     paths = sorted((data / "commits").glob("*.patch"))
     index = None
     if index_path.is_file():
-        index = DependencyIndex(json.loads(index_path.read_text(encoding="utf-8")), tests)
+        index = DependencyIndex(load_index(index_path), tests)
     replay = Replay(source) if verify else None
     verification_left = 48.0
     deadline = start + 150.0
@@ -78,7 +79,7 @@ def main(data, source, index_path, verify, verbose):
                         if verbose:
                             print(f"{patch.stem}: candidates={len(candidates)} {before/1000:.3f}s",
                                   file=sys.stderr)
-                except (OSError, ValueError, IndexError, KeyError, SyntaxError, UnicodeError) as error:
+                except (OSError, ValueError, IndexError, KeyError, SyntaxError, RecursionError, OverflowError) as error:
                     workers = all_workers
                     reason = f"{type(error).__name__}: {error}"
             if verbose or reason:
@@ -98,7 +99,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", type=Path, default=Path("/data"))
     parser.add_argument("--source", type=Path, default=Path("/opt/sqlglot"))
-    parser.add_argument("--index", type=Path, default=Path("/opt/dependencies.json"))
+    parser.add_argument("--index", type=Path, default=Path("/opt/dependencies.sqlite"))
     parser.add_argument("--verify", action="store_true", help="try budgeted pytest reruns")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()

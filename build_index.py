@@ -43,7 +43,11 @@ def current():
 
 
 def attribute(path, marker):
-    current().setdefault(path, set()).add(marker)
+    values = current().setdefault(path, set())
+    if path.startswith("@int/") and len(values) >= 16:
+        values.add(observations.UNKNOWN_OPERAND)
+    else:
+        values.add(marker)
 
 
 def line(code, number):
@@ -53,7 +57,14 @@ def line(code, number):
 
 
 def start_code(code, offset):
-    if relative(code.co_filename).startswith(("sqlglot/", "tests/")):
+    path = relative(code.co_filename)
+    if path.startswith(("sqlglot/", "tests/")):
+        if code.co_flags & 1:  # CO_OPTIMIZED distinguishes function bodies from class/module suites.
+            current().setdefault("@calls/" + path, set()).add(code.co_firstlineno)
+        if origin := observations.ORIGINS.get(id(code)):
+            current().setdefault("@factory-call/" + origin[1], set()).add(0)
+        if code.co_name == "<lambda>":
+            current().setdefault("@lambda/" + path, set()).add(code.co_firstlineno)
         sys.monitoring.set_local_events(TOOL, code, sys.monitoring.events.LINE)
     return sys.monitoring.DISABLE
 
@@ -180,11 +191,14 @@ def build(root, output):
                 target = by_owner.setdefault(name, {})
                 for path, lines in dependencies.items():
                     target.setdefault(path, set()).update(lines)
-    if not profiler.collected:
-        raise RuntimeError("pytest did not collect the pinned suite")
+    if status != 0 or not profiler.collected:
+        raise RuntimeError(f"baseline profiling did not finish cleanly (pytest status {status})")
     index = {
         "schema": 1, "complete": status == 0, "tests": profiler.collected,
-        "observed_attributes": True, "numeric_lookups": True,
+        "observed_attributes": True, "numeric_lookups": True, "call_coverage": True,
+        "scalar_fields": sorted(observations.SCALAR_FIELDS),
+        "map_fields": sorted(observations.MAP_FIELDS),
+        "function_calls": True,
     }
     index["unverified"] = [name for name in profiler.collected if not profiler.results.get(name)]
     # A file-first layout keeps runtime queries local to the changed files.

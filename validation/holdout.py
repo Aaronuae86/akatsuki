@@ -1,10 +1,12 @@
 """Generate independent mutations and compare selection with full pytest runs."""
 
 import argparse
+import ast
 from difflib import unified_diff
 import json
 import os
 from pathlib import Path
+from random import Random
 import shutil
 import subprocess
 import sys
@@ -26,7 +28,33 @@ def make_patch(source, relative, old, new):
     return (f"diff --git a/{relative} b/{relative}\n" + "".join(diff)).encode()
 
 
-def run(source, inventory, verify):
+def blind_mutation(source, family):
+    """Draw a mutation from the pinned tree without consulting coverage or labels."""
+    candidates = []
+    for path in sorted((source / "sqlglot").rglob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        lines = text.splitlines(keepends=True)
+        for node in ast.walk(ast.parse(text)):
+            if family == "blind-flag" and isinstance(node, ast.ClassDef):
+                for stmt in node.body:
+                    if (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1
+                        and isinstance(stmt.targets[0], ast.Name) and stmt.targets[0].id.isupper()
+                        and isinstance(stmt.value, ast.Constant) and type(stmt.value.value) is bool):
+                        old = lines[stmt.lineno - 1]
+                        new = old.replace(str(stmt.value.value), str(not stmt.value.value), 1)
+                        if new != old and text.count(old) == 1:
+                            candidates.append((path.relative_to(source).as_posix(), old, new))
+            elif family == "blind-threshold" and isinstance(node, ast.Compare) and len(node.ops) == 1:
+                rhs = node.comparators[0]
+                if isinstance(rhs, ast.Constant) and type(rhs.value) is int and 0 <= rhs.value <= 32:
+                    old = lines[rhs.lineno - 1]
+                    if old.isascii() and rhs.lineno == rhs.end_lineno and text.count(old) == 1:
+                        new = old[:rhs.col_offset] + str(rhs.value + 1) + old[rhs.end_col_offset:]
+                        candidates.append((path.relative_to(source).as_posix(), old, new))
+    return Random(20261121).choice(candidates)
+
+
+def run(source, inventory, verify, case=None, export=None):
     mutations = {
         "optimizer-body": (
             "sqlglot/optimizer/normalize_identifiers.py",
@@ -44,6 +72,29 @@ def run(source, inventory, verify):
             'from __future__ import annotations\n\nraise ImportError("held-out validation")\n',
         ),
     }
+    if case:
+        extra = {
+            "new-scalar": ("sqlglot/dialects/dremio.py", "SUPPORTS_USER_DEFINED_TYPES = False",
+                           "SUPPORTS_USER_DEFINED_TYPES = True"),
+            "sort-order": ("sqlglot/dialects/dremio.py", 'NULL_ORDERING = "nulls_are_last"',
+                           'NULL_ORDERING = "nulls_are_small"'),
+            "one-line-lambda": ("sqlglot/generators/sqlite.py", 'self.func("RANDOM", e.this)',
+                                'self.func("RANDOM2", e.this)'),
+            "factory-string": ("sqlglot/generators/sqlite.py", 'exp.If: rename_func("IIF")',
+                               'exp.If: rename_func("IF")'),
+            "nested-factory": ("sqlglot/generators/dremio.py", '_date_delta_sql("DATE_SUB")',
+                               '_date_delta_sql("DATE_ADD")'),
+            "test-body": ("tests/dialects/test_dremio.py",
+                          'self.validate_identity("CAST(x AS SMALLINT)", "CAST(x AS INT)")',
+                          'self.validate_identity("CAST(x AS SMALLINT)", "CAST(x AS FLOAT)")'),
+            "threshold": ("sqlglot/parsers/bigquery.py", "len(table_parts) > 1 and table_parts[-2]",
+                          "len(table_parts) > 2 and table_parts[-2]"),
+            "type-table": ("sqlglot/generators/dremio.py", 'exp.DType.BINARY: "VARBINARY"',
+                           'exp.DType.BINARY: "VARCHAR"'),
+            "new-local": ("sqlglot/generators/dremio.py", 'if expression.text("kind") == "AS OF":',
+                          'kind = expression.text("kind")\n        if kind == "AT":'),
+        }
+        mutations = {case: blind_mutation(source, case) if case.startswith("blind-") else (mutations | extra)[case]}
     names = {test["id"]: test["number"] for test in json.loads(inventory.read_text())["tests"]}
     with TemporaryDirectory(prefix="blast-holdout-") as temporary:
         root = Path(temporary)
@@ -81,11 +132,16 @@ def run(source, inventory, verify):
                     else:
                         assert not status["collection_error"] and status["status"] in (0, 1), status
                         failing = set(names) - set(status["passed"])
-                        assert failing, f"mutation {name} did not break a test"
+                        if case is None:
+                            assert failing, f"mutation {name} did not break a test"
                         omitted = sorted(test for test in failing if names[test] not in results[name])
                         assert not omitted, f"{name} omitted {len(omitted)} failing tests: {omitted}"
                         print(f"{name}: {len(failing)} affected tests, {len(results[name])} selected, "
                               "zero omissions", flush=True)
+                        if export:
+                            (export / "commits").mkdir(parents=True, exist_ok=True)
+                            (export / "commits" / f"{name}.patch").write_bytes(patch)
+                            (export / f"{name}.json").write_text(json.dumps(sorted(names[n] for n in failing)))
         finally:
             replay.close()
 
@@ -95,5 +151,7 @@ if __name__ == "__main__":
     parser.add_argument("--source", type=Path, default=Path("/opt/sqlglot"))
     parser.add_argument("--inventory", type=Path, default=Path("/data/tests.json"))
     parser.add_argument("--verify", action="store_true")
+    parser.add_argument("--case")
+    parser.add_argument("--export", type=Path)
     args = parser.parse_args()
-    run(args.source, args.inventory, args.verify)
+    run(args.source, args.inventory, args.verify, args.case, args.export)
