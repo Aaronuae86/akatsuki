@@ -84,8 +84,10 @@ def print_comparison(report, target):
             if change:
                 print(f"    {commit}: {change/1000:+.3f} s schedule savings")
     if target is not None:
-        failed |= candidate["score"] >= target
-        print(f"  Strict local target < {target:g} s: {'FAIL' if failed else 'PASS'}")
+        totals = [row["total_us"] / 1e6 for row in candidate["trials"]]
+        failed |= any(value >= target for value in totals)
+        times = ", ".join(f"{value:.3f}" for value in totals)
+        print(f"  Every local run < {target:g} s: {'FAIL' if failed else 'PASS'} ({times})")
     return failed
 
 
@@ -96,7 +98,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch", action="append", required=True, type=Path)
     parser.add_argument("--mode", choices=("practice", "final"), default="practice")
     parser.add_argument("--runs", type=int, choices=(1, 3, 5))
-    parser.add_argument("--target", type=float, help="strict score threshold for one labeled batch")
+    parser.add_argument("--target", type=float, help="strict unrounded total for every run of one labeled batch")
     parser.add_argument("--report", type=Path, help="save all trial summaries and per-patch audits as JSON")
     args = parser.parse_args()
     if args.target is not None and len(args.batch) != 1:

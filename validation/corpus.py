@@ -68,10 +68,11 @@ def fixture_mutations(source):
                 yield "fixture", path, i, 1, [after]
 
 
-def freeze(source, inventory, target, seed=417230, per_family=3):
+def freeze(source, inventory, target, seed=417230, per_family=3, families=None):
     candidates = {}
     for item in (*python_mutations(source), *fixture_mutations(source)):
-        candidates.setdefault(item[0], []).append(item)
+        if families is None or item[0] in families:
+            candidates.setdefault(item[0], []).append(item)
     random = Random(seed)
     for split in ("development", "holdout"):
         (target / split / "commits").mkdir(parents=True, exist_ok=False)
@@ -226,10 +227,11 @@ if __name__ == "__main__":
     cli.add_argument("--retry-unscored", action="store_true")
     cli.add_argument("--seed", type=int, default=417230)
     cli.add_argument("--per-family", type=int, default=3)
+    cli.add_argument("--family", action="append", choices=("dispatch", "parser", "optimizer", "configuration", "fixture"))
     args = cli.parse_args()
     if args.action == "freeze":
         if args.per_family < 2:
             cli.error("--per-family must be at least 2")
-        freeze(args.source, args.inventory, args.target, args.seed, args.per_family)
+        freeze(args.source, args.inventory, args.target, args.seed, args.per_family, args.family)
     else:
         label(args.source, args.target, args.workers, args.retry_unscored)

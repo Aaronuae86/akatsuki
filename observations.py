@@ -127,7 +127,7 @@ def dynamic_get(getter, receiver, name, *default):
     return getter(receiver, name, *default)
 
 
-def observe(receiver, name, value_tag=None, key_tag=None, safe_copy=False):
+def observe(receiver, name, value_tag=None, key_tag=None, safe_copy=False, copy_target=None):
     callback = CALLBACK
     if callback is not None:
         if name == TYPE_FIELD and not safe_copy:
@@ -145,6 +145,10 @@ def observe(receiver, name, value_tag=None, key_tag=None, safe_copy=False):
             )
             DECLARATIONS[key] = found
         if found:
+            if copy_target is not None and type(vars(cls).get(name)) is dict:
+                for dependency in found:
+                    callback("@dispatch-copy/" + dependency, copy_target)
+                return receiver
             marker = 0
             frame = sys._getframe(1)
             module = frame.f_globals.get("__name__")
@@ -245,16 +249,19 @@ def numeric_lookup(table, key):
     return table.get(key)
 
 
-def wrap(node, name, safe_copy=False):
+def wrap(node, name, safe_copy=False, copy_target=None):
+    keywords = [ast.keyword(arg="safe_copy", value=ast.Constant(True))] if safe_copy else []
+    if copy_target is not None:
+        keywords.append(ast.keyword(arg="copy_target", value=ast.Constant(copy_target)))
     return ast.copy_location(
         ast.Call(func=ast.Name(id=ATTRIBUTE_NAME, ctx=ast.Load()), args=[node, ast.Constant(name)],
-                 keywords=[ast.keyword(arg="safe_copy", value=ast.Constant(True))] if safe_copy else []),
+                 keywords=keywords),
         node,
     )
 
 
-def type_copy_source(node):
-    if isinstance(node, ast.Attribute) and node.attr == TYPE_FIELD:
+def copy_source(node, field):
+    if isinstance(node, ast.Attribute) and node.attr == field:
         return node
     if not isinstance(node, ast.DictComp) or len(node.generators) != 1:
         return None
@@ -269,19 +276,45 @@ def type_copy_source(node):
     iterator = loop.iter
     if not (isinstance(iterator, ast.Call) and not iterator.args and not iterator.keywords
             and isinstance(iterator.func, ast.Attribute) and iterator.func.attr == "items"
-            and isinstance(iterator.func.value, ast.Attribute) and iterator.func.value.attr == TYPE_FIELD):
+            and isinstance(iterator.func.value, ast.Attribute) and iterator.func.value.attr == field):
         return None
     for condition in loop.ifs:
         if not (isinstance(condition, ast.Compare) and len(condition.ops) == 1
                 and isinstance(condition.left, ast.Name) and condition.left.id == key.id):
             return None
         op, right = condition.ops[0], condition.comparators[0]
-        if isinstance(op, ast.NotEq) and dtype_literal(right):
+        def literal(value):
+            if field == TYPE_FIELD:
+                return dtype_literal(value)
+            return isinstance(value, ast.Attribute) and isinstance(value.value, ast.Name) and value.value.id == "exp"
+        if isinstance(op, ast.NotEq) and literal(right):
             continue
-        if isinstance(op, ast.NotIn) and isinstance(right, ast.Tuple) and all(dtype_literal(x) for x in right.elts):
+        if isinstance(op, ast.NotIn) and isinstance(right, (ast.Tuple, ast.Set)) and all(literal(x) for x in right.elts):
             continue
         return None
     return iterator.func.value
+
+
+def filtered_dispatch_table(node):
+    """Recognize a spread dictionary whose only postprocessing discards None values."""
+    if not isinstance(node, ast.DictComp) or len(node.generators) != 1:
+        return None
+    loop = node.generators[0]
+    target = loop.target
+    if (loop.is_async or not isinstance(target, ast.Tuple) or len(target.elts) != 2
+        or not all(isinstance(x, ast.Name) for x in (*target.elts, node.key, node.value))
+        or [x.id for x in target.elts] != [node.key.id, node.value.id] or len(loop.ifs) != 1):
+        return None
+    cond = loop.ifs[0]
+    if not (isinstance(cond, ast.Compare) and isinstance(cond.left, ast.Name)
+            and cond.left.id == node.value.id and len(cond.ops) == 1 and isinstance(cond.ops[0], ast.IsNot)
+            and isinstance(cond.comparators[0], ast.Constant) and cond.comparators[0].value is None):
+        return None
+    items = loop.iter
+    if (isinstance(items, ast.Call) and not items.args and not items.keywords
+        and isinstance(items.func, ast.Attribute) and items.func.attr == "items"
+        and isinstance(items.func.value, ast.Dict)):
+        return items.func.value
 
 
 def compare_operands(left, right, site, negate):
@@ -313,12 +346,23 @@ class Reads(ast.NodeTransformer):
         self.path = path
         self.type_copies = set()
         self.type_tables = set()
+        self.dispatch_tables = {}
+        self.dispatch_copies = {}
+        self.classes = []
 
     def visit_ClassDef(self, node):
+        self.classes.append(node.name)
+        module = self.path.removesuffix(".py").replace("/", ".")
+        target = f"@attr/{module}/{'.'.join(self.classes)}/{DISPATCH_FIELD}"
+        for statement in node.body:
+            if class_member(statement) == DISPATCH_FIELD:
+                table = filtered_dispatch_table(statement.value) or statement.value
+                self.dispatch_tables[id(table)] = target
         tables = {id(stmt.value) for stmt in node.body if class_member(stmt) == TYPE_FIELD}
         self.type_tables.update(tables)
         self.generic_visit(node)
         self.type_tables.difference_update(tables)
+        self.classes.pop()
         return node
 
     def visit_If(self, node):
@@ -347,7 +391,11 @@ class Reads(ast.NodeTransformer):
         copied = set()
         if id(node) in self.type_tables:
             copied = {id(attr) for key, value in zip(node.keys, node.values)
-                      if key is None and (attr := type_copy_source(value)) is not None}
+                      if key is None and (attr := copy_source(value, TYPE_FIELD)) is not None}
+        if target := self.dispatch_tables.get(id(node)):
+            for key, value in zip(node.keys, node.values):
+                if key is None and (source := copy_source(value, DISPATCH_FIELD)) is not None:
+                    self.dispatch_copies[id(source)] = target
         self.type_copies.update(copied)
         self.generic_visit(node)
         self.type_copies.difference_update(copied)
@@ -397,13 +445,14 @@ class Reads(ast.NodeTransformer):
             node.attr in TRACKED_CLASS_ATTRIBUTES or node.attr in SCALAR_FIELDS or node.attr in MAP_FIELDS
             or node.attr == DISPATCH_FIELD
         ):
-            node.value = wrap(node.value, node.attr, safe_copy=id(node) in self.type_copies)
+            node.value = wrap(node.value, node.attr, safe_copy=id(node) in self.type_copies,
+                              copy_target=self.dispatch_copies.get(id(node)))
         return node
 
     def visit_Call(self, node):
         if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Attribute):
             field = node.func.value
-            if (self.path == "sqlglot/generator.py" and node.func.attr == "get"
+            if (self.path in {"sqlglot/generator.py", "sqlglot/transforms.py"} and node.func.attr == "get"
                 and field.attr in ("_dispatch", DISPATCH_FIELD) and len(node.args) == 1 and not node.keywords):
                 return ast.copy_location(ast.Call(
                     func=ast.Name(id=DISPATCH_NAME, ctx=ast.Load()),

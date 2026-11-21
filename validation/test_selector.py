@@ -230,6 +230,48 @@ def test_removed_dispatch_entry_keeps_key_consumers_and_eager_fallback(tmp_path)
     assert index.candidates(diff).names == set(names)
 
 
+def test_copied_dispatch_preserves_transitive_consumers_and_unrecognized_eager_reads(tmp_path):
+    original = "class Base:\n    TRANSFORMS = {exp.Int: handler, exp.Str: other}\n"
+    source = tmp_path / SOURCE
+    source.parent.mkdir()
+    source.write_bytes(original.encode())
+    changes = apply_diff(tmp_path, patch(SOURCE, original, original.replace("exp.Int: handler, ", "")))
+    base, child, leaf = [f"@attr/sqlglot.mod/{name}/TRANSFORMS" for name in ("Base", "Child", "Leaf")]
+    files = {
+        SOURCE: {"<session>": [1, 2]},
+        "@dispatch-copy/" + base: {"<session>": [child]},
+        "@dispatch-copy/" + child: {"<session>": [leaf]},
+        leaf + "/key/Int": {PASSED: [0]},
+        leaf + "/key/Str": {OTHER: [0]},
+    }
+    names = [PASSED, OTHER, "whole-table"]
+    index = DependencyIndex({
+        "tests": names, "files": files, "observed_attributes": True,
+        "dispatch_modules": ["sqlglot.mod"], "dispatch_exports": ["Int", "Str"],
+    }, [{"id": name} for name in names])
+    assert index.candidates(changes).names == {PASSED}
+    files[child] = {"whole-table": [0]}
+    assert index.candidates(changes).names == {PASSED, "whole-table"}
+    files["@eager/" + leaf] = {"<session>": [0]}
+    assert index.candidates(changes).names == set(names)
+
+
+def test_dispatch_spread_recognizes_only_key_preserving_copies():
+    def copied(expression):
+        return observations.copy_source(ast.parse(expression, mode="eval").body, "TRANSFORMS")
+    assert copied("Base.TRANSFORMS") is not None
+    assert copied("{k: v for k, v in Base.TRANSFORMS.items() if k not in {exp.Add}}") is not None
+    assert copied("{k: wrap(v) for k, v in Base.TRANSFORMS.items()}") is None
+    assert copied("{k: v for k, v in Base.TRANSFORMS.items() if v()}") is None
+    inner = "{**Base.TRANSFORMS, exp.Add: handler}"
+    filtered = "{k: v for k, v in " + inner + ".items() if v is not None}"
+    assert isinstance(observations.filtered_dispatch_table(ast.parse(filtered, mode="eval").body), ast.Dict)
+    changed_keys = filtered.replace("k: v for", "v: k for")
+    assert observations.filtered_dispatch_table(ast.parse(changed_keys, mode="eval").body) is None
+    changed_filter = filtered.replace("v is not None", "keep(v)")
+    assert observations.filtered_dispatch_table(ast.parse(changed_filter, mode="eval").body) is None
+
+
 def test_added_type_key_keeps_existing_misses_and_whole_table_readers(tmp_path):
     original = ('class Generator:\n    TYPE_MAPPING = {\n'
                 '        **Parent.TYPE_MAPPING,\n        exp.DType.INT: "INT",\n    }\n')

@@ -94,6 +94,16 @@ def shape(node):
     return ast.dump(node, include_attributes=False)
 
 
+def same_tree(left, right):
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, ast.AST):
+        return all(same_tree(getattr(left, key), getattr(right, key)) for key in left._fields)
+    if isinstance(left, list):
+        return len(left) == len(right) and all(same_tree(a, b) for a, b in zip(left, right))
+    return left == right
+
+
 def factory_edits(a, b, path, files, sites):
     """Match edits confined to literal arguments of observed closure factories."""
     if type(a) is not type(b):
@@ -222,7 +232,7 @@ def compare_blocks(before, after, changed_functions, assignments, classes=(), sc
     if len(before) != len(after):
         return False
     for old, new in zip(before, after):
-        if shape(old) == shape(new):
+        if same_tree(old, new):
             continue
         if type(old) is not type(new):
             return False
@@ -292,8 +302,6 @@ def same_except_lambdas(old, new, changed_functions):
 
 def comparison_site(old, new):
     """Find a sole identity/equality operator substitution in otherwise equal ASTs."""
-    if shape(old) == shape(new):
-        return None
     matches = []
 
     def compare(before, after):
@@ -418,7 +426,10 @@ class DependencyIndex:
 
     def add(self, result, dependencies, lines=None):
         for scope, observed in dependencies.items():
-            if lines is not None and not any(line in lines for line in observed):
+            if lines is not None and (
+                lines.isdisjoint(observed) if isinstance(lines, set)
+                else not any(line in lines for line in observed)
+            ):
                 continue
             if scope == SESSION:
                 return False
@@ -461,7 +472,7 @@ class DependencyIndex:
                     return self.fallback(f"invalid Python source {path}")
             if not self.add(result, dependencies, {0}):
                 return self.fallback(f"source read during collection {path}")
-            if shape(old) == shape(new):
+            if same_tree(old, new):
                 continue
             if not dependencies:
                 return self.fallback(f"no baseline coverage for {path}")
@@ -480,11 +491,13 @@ class DependencyIndex:
             if functions:
                 observed = {}
                 entry_lines = None
-                if len(changes) == 1 and not assignments:
-                    site = comparison_site(old, new)
+                if len(changes) == 1 and not assignments and len(functions) == 1:
+                    # compare_blocks has established that every other body is unchanged.
+                    before, after = functions[0]
+                    site = comparison_site(before, after)
                     if site:
                         observed = self.files.get(f"@compare/{path}/{site}", {})
-                    elif edit := threshold_edit(old, new):
+                    elif edit := threshold_edit(before, after):
                         node, (op1, value1), (op2, value2) = edit
                         is_tuple = type(value1) is tuple
                         kind = "tuple" if is_tuple else "int"
@@ -498,7 +511,7 @@ class DependencyIndex:
                             if values and unknown not in values
                             and all(op1(decode(v), value1) == op2(decode(v), value2) for v in values)
                         }
-                    elif edit := guard_edit(old, new):
+                    elif edit := guard_edit(before, after):
                         entry_lines = edit.entry_lines
                         observed = {
                             scope: [0] for scope, values in self.files.get(guard_site(path, edit.anchor), {}).items()
@@ -562,12 +575,26 @@ class DependencyIndex:
             return False
         if field == DISPATCH_FIELD:
             tag = f"@attr/{module}/{owner}/{field}"
-            if not isolated_assignment or module not in self.dispatch_modules or self.files.get("@eager/" + tag):
+            if not isolated_assignment or module not in self.dispatch_modules:
                 return False
+            tags = {tag}
+            pending = [tag]
+            while pending:
+                current = pending.pop()
+                if self.files.get("@eager/" + current):
+                    return False
+                for targets in self.files.get("@dispatch-copy/" + current, {}).values():
+                    for target in targets:
+                        if target not in tags:
+                            tags.add(target)
+                            pending.append(target)
             for key, value in deleted_dispatch_entries(old_value, new_value):
                 if key not in self.dispatch_exports:
                     return False
-                if isinstance(value, ast.Lambda) and not (value.args.defaults or any(value.args.kw_defaults)):
+                if isinstance(value, ast.Name):
+                    # Deleting a successful lookup of a bound name has no call-time effect.
+                    pass
+                elif isinstance(value, ast.Lambda) and not (value.args.defaults or any(value.args.kw_defaults)):
                     pass
                 elif isinstance(value, ast.Call):
                     location = f"{path}/{value.lineno}:{value.col_offset}"
@@ -577,9 +604,9 @@ class DependencyIndex:
                         return False
                 else:
                     return False
-                if not self.add(result, self.files.get(f"{tag}/key/{key}", {})):
+                if not all(self.add(result, self.files.get(f"{dest}/key/{key}", {})) for dest in tags):
                     return False
-            return self.add(result, self.files.get(tag, {}))
+            return all(self.add(result, self.files.get(dest, {})) for dest in tags)
         keys = [field, "required_args"] if field == "arg_types" else [field]
         for key in keys:
             tag = f"@attr/{module}/{owner}/{key}"
