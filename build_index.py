@@ -201,6 +201,8 @@ def build(root, output):
         "scalar_fields": sorted(observations.SCALAR_FIELDS),
         "map_fields": sorted(observations.MAP_FIELDS),
         "function_calls": True,
+        "required_key_coverage": True,
+        "scoped_type_map": True,
         "dispatch_exports": sorted(name for names in observations.DISPATCH_EXPORTS.values() for name in names),
         "dispatch_modules": sorted(
             name for name, module in sys.modules.copy().items()

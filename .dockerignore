@@ -11,3 +11,5 @@
 !selector.py
 !index_store.py
 !verify.py
+!validation/
+!validation/executor_coverage.py

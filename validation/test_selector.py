@@ -1,4 +1,5 @@
 import ast
+from concurrent.futures import Future, ProcessPoolExecutor
 from difflib import unified_diff
 from enum import Enum
 import json
@@ -12,7 +13,7 @@ import pytest
 import observations
 import verify
 
-from dependencies import DependencyIndex, comparison_site, guard_edit
+from dependencies import DependencyIndex, comparison_site, guard_edit, predicate_only
 from observations import GUARD_NAME, Reads, guard_value
 from patches import apply_diff
 from schedule import cost, pack
@@ -27,6 +28,36 @@ def patch(path, old, new):
     lines = unified_diff(old.splitlines(keepends=True), new.splitlines(keepends=True),
                          f"a/{path}", f"b/{path}")
     return (f"diff --git a/{path} b/{path}\n" + "".join(lines)).encode()
+
+
+def test_query_replay_requires_exact_predicate_change():
+    original = ast.parse("def f(n):\n    if n > 2:\n        return n\n    return 0\n")
+    assert predicate_only(original, ast.parse("def f(n):\n    if not (n > 2):\n        return n\n    return 0\n"))
+    assert predicate_only(original, ast.parse("def f(n):\n    if n >= 2:\n        return n\n    return 0\n"))
+    assert not predicate_only(original, ast.parse("def f(n):\n    if n > read():\n        return n\n    return 0\n"))
+    assert not predicate_only(original, ast.parse("def f(n):\n    if n >= 2:\n        return n\n    return 1\n"))
+
+
+def test_query_replay_propagates_failure_from_affected_job(monkeypatch):
+    def mp_execute(index):
+        raise ArithmeticError(index)
+
+    def submit(pool, fn, /, *args):
+        future = Future()
+        try:
+            future.set_result(fn(*args))
+        except ArithmeticError as error:
+            future.set_exception(error)
+        return future
+
+    mp_execute.__module__ = "tests.test_executor"
+    monkeypatch.setattr(ProcessPoolExecutor, "submit", submit)
+    with verify.QueryReplay([1], 2) as replay:
+        assert ProcessPoolExecutor.submit(None, mp_execute, 0).result() is None
+        with pytest.raises(ArithmeticError):
+            ProcessPoolExecutor.submit(None, mp_execute, 1).result()
+        assert replay.seen == 2
+    assert ProcessPoolExecutor.submit is submit
 
 
 def impact(tmp_path, before, after, dependencies):
@@ -65,6 +96,42 @@ def test_version_observations_include_default_maxsize(monkeypatch):
     assert json.loads(calls[tag]) == [sys.maxsize]
     observations.integer_value(("23",), tag)
     assert calls[tag] == "?"
+
+
+def test_required_flag_checks_missing_key_and_preserves_whole_dictionary_reads(tmp_path):
+    original = "class Expr:\n    arg_types = {'x': False, 'y': True, 'z': True}\n"
+    source = tmp_path / SOURCE
+    source.parent.mkdir()
+    source.write_bytes(original.encode())
+    changes = apply_diff(tmp_path, patch(SOURCE, original, original.replace("False", "True")))
+    names = (PASSED, OTHER, "keys-only", "missing-y", "possible-error-reordering")
+    tag = "@attr/sqlglot.mod/Expr/"
+    files = {
+        SOURCE: {"<session>": [1, 2]},
+        tag + "arg_types": {OTHER: [0], "keys-only": [1]},
+        tag + "required_args/missing/x": {PASSED: [0]},
+        tag + "required_args/missing/y": {"missing-y": [0], "possible-error-reordering": [0]},
+        tag + "required_args/missing/z": {"possible-error-reordering": [0]},
+    }
+    data = {"tests": names, "observed_attributes": True, "required_key_coverage": True, "files": files}
+    index = DependencyIndex(data, [{"id": name} for name in names])
+    assert index.candidates(changes).names == {PASSED, OTHER, "possible-error-reordering"}
+    files[tag + "required_args/missing/x"]["<session>"] = [0]
+    assert index.candidates(changes).names == set(names)
+
+
+@pytest.mark.parametrize("patched, expected", [("3 > n", set()), ("3 >= n", {PASSED})])
+def test_reversed_threshold_uses_pinned_observations(tmp_path, patched, expected):
+    original = "def f(n):\n    return n < 3\n"
+    source = tmp_path / SOURCE
+    source.parent.mkdir()
+    source.write_bytes(original.encode())
+    changes = apply_diff(tmp_path, patch(SOURCE, original, original.replace("n < 3", patched)))
+    tests = [{"id": PASSED}, {"id": OTHER}, {"id": "unknown"}]
+    files = {SOURCE: {t["id"]: [2] for t in tests},
+             f"@int/{SOURCE}/2:11": {PASSED: [3], OTHER: [2]}}
+    index = DependencyIndex({"tests": [t["id"] for t in tests], "files": files}, tests)
+    assert index.candidates(changes).names == expected | {"unknown"}
 
 
 @pytest.mark.skipif(os.name != "posix", reason="pytest-timeout uses process termination on Windows")
@@ -311,6 +378,33 @@ def test_type_lookup_records_both_value_and_requested_key(monkeypatch):
     assert lookup(DType.TEXT, "TEXT") == "TEXT"
     assert "@type-map/key/INT" in visits and "@type-map/key/TEXT" in visits
     assert any(path.endswith("/TYPE_MAPPING/value/'NUMBER'") for path in visits)
+    assert f"@attr/sqlglot.test/{Generator.__qualname__}/TYPE_MAPPING/key/INT" in visits
+
+
+def test_scoped_type_mapping_retains_copied_and_whole_map_consumers(tmp_path):
+    before = 'class Generator:\n    TYPE_MAPPING = {exp.DType.INT: "NUMBER"}\n'
+    source = tmp_path / SOURCE
+    source.parent.mkdir()
+    source.write_bytes(before.encode())
+    changes = apply_diff(tmp_path, patch(SOURCE, before, before.replace('exp.DType.INT: "NUMBER"', "")))
+    base = "@attr/sqlglot.mod/Generator/TYPE_MAPPING"
+    derived = "@attr/sqlglot.other/Derived/TYPE_MAPPING"
+    names = [PASSED, OTHER, "whole-map"]
+    files = {
+        SOURCE: {"<session>": [1, 2]},
+        "@dispatch-copy/" + base: {"<session>": [derived]},
+        derived + "/key/INT": {PASSED: [0]},
+        derived: {"whole-map": [0]},
+        "@attr/sqlglot.unrelated/Generator/TYPE_MAPPING/key/INT": {OTHER: [0]},
+        "@type-map/key/INT": {PASSED: [0], OTHER: [0]},
+    }
+    index = DependencyIndex({
+        "tests": names, "files": files, "observed_attributes": True, "scoped_type_map": True,
+        "dtype_names": {"INT": "INT"}, "dispatch_modules": ["sqlglot.mod"], "map_fields": ["TYPE_MAPPING"],
+    }, [{"id": name} for name in names])
+    assert index.candidates(changes).names == {PASSED, "whole-map"}
+    files["@type-map/unbound"] = {"<session>": [0]}
+    assert index.candidates(changes).names == set(names)
 
 
 def test_lambda_definition_and_invocation_have_separate_coverage(tmp_path):

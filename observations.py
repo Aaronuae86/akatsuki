@@ -127,7 +127,7 @@ def dynamic_get(getter, receiver, name, *default):
     return getter(receiver, name, *default)
 
 
-def observe(receiver, name, value_tag=None, key_tag=None, safe_copy=False, copy_target=None):
+def observe(receiver, name, value_tag=None, key_tag=None, safe_copy=False, copy_target=None, keys_only=False):
     callback = CALLBACK
     if callback is not None:
         if name == TYPE_FIELD and not safe_copy:
@@ -144,6 +144,8 @@ def observe(receiver, name, value_tag=None, key_tag=None, safe_copy=False, copy_
                 if name in vars(base) and base.__module__.startswith("sqlglot.")
             )
             DECLARATIONS[key] = found
+        if name == TYPE_FIELD and not found:
+            callback("@type-map/unbound", 0)
         if found:
             if copy_target is not None and type(vars(cls).get(name)) is dict:
                 for dependency in found:
@@ -153,6 +155,24 @@ def observe(receiver, name, value_tag=None, key_tag=None, safe_copy=False, copy_
             frame = sys._getframe(1)
             module = frame.f_globals.get("__name__")
             function = frame.f_code.co_qualname
+            if name == "required_args" and (module, function) == (
+                "sqlglot.expressions.core", "Expression.error_messages",
+            ):
+                arguments, types = receiver.args, receiver.arg_types
+                if type(arguments) is dict and type(types) is dict and all(type(k) is str for k in types):
+                    for arg in types:
+                        value = arguments.get(arg)
+                        cls = type(value)
+                        # Retain unknown values, including custom list subclasses.
+                        if (cls in (str, bytes, int, float, bool, tuple, dict)
+                            or (cls is list and value)
+                            or (cls.__module__.startswith("sqlglot.expressions.") and list not in cls.__mro__)):
+                            continue
+                        for dependency in found:
+                            callback(dependency + "/missing/" + arg, 0)
+                    return receiver
+            if name == "arg_types" and keys_only and type(getattr(receiver, name)) is dict:
+                marker = 1
             if (name == "MAP_KEYS_ARE_ARBITRARY_EXPRESSIONS"
                 and (module, function) == ("sqlglot.parser", "Parser._parse_bracket")):
                 # A subclass with its own flag does not read the base value.
@@ -192,7 +212,11 @@ def observe(receiver, name, value_tag=None, key_tag=None, safe_copy=False, copy_
                 site = dependency
                 if value_tag is not None:
                     site += "/value/" + value_tag
-                if key_tag is not None and name != TYPE_FIELD:
+                if key_tag is not None and name == TYPE_FIELD:
+                    callback(dependency + "/key/" + key_tag, marker)
+                    if value_tag is None:
+                        continue
+                elif key_tag is not None:
                     site += "/key/" + key_tag
                 callback(site, marker)
                 if LOADING and (name in SCALAR_FIELDS or name in MAP_FIELDS or name == DISPATCH_FIELD):
@@ -249,10 +273,12 @@ def numeric_lookup(table, key):
     return table.get(key)
 
 
-def wrap(node, name, safe_copy=False, copy_target=None):
+def wrap(node, name, safe_copy=False, copy_target=None, keys_only=False):
     keywords = [ast.keyword(arg="safe_copy", value=ast.Constant(True))] if safe_copy else []
     if copy_target is not None:
         keywords.append(ast.keyword(arg="copy_target", value=ast.Constant(copy_target)))
+    if keys_only:
+        keywords.append(ast.keyword(arg="keys_only", value=ast.Constant(True)))
     return ast.copy_location(
         ast.Call(func=ast.Name(id=ATTRIBUTE_NAME, ctx=ast.Load()), args=[node, ast.Constant(name)],
                  keywords=keywords),
@@ -346,9 +372,19 @@ class Reads(ast.NodeTransformer):
         self.path = path
         self.type_copies = set()
         self.type_tables = set()
+        self.type_targets = {}
         self.dispatch_tables = {}
         self.dispatch_copies = {}
         self.classes = []
+        self.key_reads = set()
+
+    def mark_key_read(self, node):
+        if isinstance(node, ast.Attribute) and node.attr == "arg_types":
+            self.key_reads.add(id(node))
+
+    def visit_For(self, node):
+        self.mark_key_read(node.iter)
+        return self.generic_visit(node)
 
     def visit_ClassDef(self, node):
         self.classes.append(node.name)
@@ -359,6 +395,8 @@ class Reads(ast.NodeTransformer):
                 table = filtered_dispatch_table(statement.value) or statement.value
                 self.dispatch_tables[id(table)] = target
         tables = {id(stmt.value) for stmt in node.body if class_member(stmt) == TYPE_FIELD}
+        target = f"@attr/{module}/{'.'.join(self.classes)}/{TYPE_FIELD}"
+        self.type_targets.update(dict.fromkeys(tables, target))
         self.type_tables.update(tables)
         self.generic_visit(node)
         self.type_tables.difference_update(tables)
@@ -392,6 +430,7 @@ class Reads(ast.NodeTransformer):
         if id(node) in self.type_tables:
             copied = {id(attr) for key, value in zip(node.keys, node.values)
                       if key is None and (attr := copy_source(value, TYPE_FIELD)) is not None}
+            self.dispatch_copies.update(dict.fromkeys(copied, self.type_targets[id(node)]))
         if target := self.dispatch_tables.get(id(node)):
             for key, value in zip(node.keys, node.values):
                 if key is None and (source := copy_source(value, DISPATCH_FIELD)) is not None:
@@ -410,6 +449,9 @@ class Reads(ast.NodeTransformer):
         return node
 
     def visit_Compare(self, node):
+        for op, arg in zip(node.ops, node.comparators):
+            if isinstance(op, (ast.In, ast.NotIn)):
+                self.mark_key_read(arg)
         self.generic_visit(node)
         kind = "int" if integer_predicate(node) else "tuple" if tuple_predicate(node) else None
         if kind:
@@ -446,10 +488,13 @@ class Reads(ast.NodeTransformer):
             or node.attr == DISPATCH_FIELD
         ):
             node.value = wrap(node.value, node.attr, safe_copy=id(node) in self.type_copies,
-                              copy_target=self.dispatch_copies.get(id(node)))
+                              copy_target=self.dispatch_copies.get(id(node)), keys_only=id(node) in self.key_reads)
         return node
 
     def visit_Call(self, node):
+        if (self.path == "sqlglot/expressions/core.py" and isinstance(node.func, ast.Name)
+            and node.func.id == "len" and len(node.args) == 1 and not node.keywords):
+            self.mark_key_read(node.args[0])
         if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Attribute):
             field = node.func.value
             if (self.path in {"sqlglot/generator.py", "sqlglot/transforms.py"} and node.func.attr == "get"

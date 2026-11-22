@@ -1,6 +1,7 @@
 """Budget and isolate pytest verification jobs."""
 
 from contextlib import contextmanager
+from importlib.util import cache_from_source
 import json
 import os
 from pathlib import Path
@@ -12,7 +13,7 @@ from tempfile import TemporaryDirectory
 import time
 
 
-IGNORE = shutil.ignore_patterns(".git", "__pycache__", ".pytest_cache")
+IGNORE = shutil.ignore_patterns(".git", ".pytest_cache")
 VERIFIER = Path(__file__).with_name("verify.py").resolve()
 
 
@@ -33,12 +34,18 @@ class Replay:
             copier = symlink_file if os.name == "posix" else shutil.copyfile
             shutil.copytree(self.root, self.worktree, ignore=IGNORE, copy_function=copier)
         written = []
+        cached = []
         try:
             for change in changes:
                 if change.original == change.updated:
                     continue
                 target = self.worktree / change.path
                 written.append(change)
+                if target.suffix == ".py":
+                    bytecode = Path(cache_from_source(str(target)))
+                    if bytecode.exists():
+                        cached.append(bytecode)
+                        bytecode.unlink()
                 if target.exists() or target.is_symlink():
                     target.unlink()
                 if change.updated is not None:
@@ -55,19 +62,23 @@ class Replay:
                         symlink_file(self.root / change.path, target)
                     else:
                         target.write_bytes(change.original)
+            for bytecode in cached:
+                source = self.root / bytecode.relative_to(self.worktree)
+                (symlink_file if os.name == "posix" else shutil.copyfile)(source, bytecode)
 
     def close(self):
         if self.workspace is not None:
             self.workspace.cleanup()
 
-    def check(self, changes, names, budget):
+    def check(self, changes, names, budget, **options):
         report = None
         start = time.monotonic()
         try:
             with self.tree(changes) as cwd:
                 report = cwd.parent / "result.json"
                 report.unlink(missing_ok=True)
-                request = {"names": sorted(names), "report": str(report), "timeout": max(1.0, budget - 0.4)}
+                request = {"names": sorted(names), "report": str(report),
+                           "timeout": max(1.0, budget - 0.4), **options}
                 env = {
                     **os.environ,
                     "PYTHONPATH": str(cwd),

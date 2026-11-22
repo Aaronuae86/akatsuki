@@ -7,9 +7,11 @@ import os
 from pathlib import Path
 import sys
 import time
+from tempfile import TemporaryDirectory
 
 
 TOOL = 3
+EXECUTOR_TEST = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
 
 
 def start_trace(root):
@@ -73,8 +75,7 @@ def collect(root, target):
     files = start_trace(root)
     start = time.process_time()
     try:
-        status = pytest.main(["-q", "-p", "no:cacheprovider",
-                              "tests/test_executor.py::TestExecutor::test_execute_tpcds"])
+        status = pytest.main(["-q", "-p", "no:cacheprovider", EXECUTOR_TEST])
     finally:
         ProcessPoolExecutor.submit = original
         finish_trace(root, files, target / "parent.json", time.process_time() - start)
@@ -82,9 +83,22 @@ def collect(root, target):
         raise RuntimeError(f"Incomplete query coverage, pytest status {status}")
 
 
+def index(root, output):
+    with TemporaryDirectory() as temporary:
+        target = Path(temporary) / "trace"
+        collect(root, target)
+        parent = json.loads((target / "parent.json").read_bytes())
+        jobs = [json.loads(p.read_bytes()) for p in sorted(
+            target.glob("query-*.json"), key=lambda p: int(p.stem.split("-")[-1]),
+        )]
+        output.write_text(json.dumps({"parent": parent, "jobs": jobs}, separators=(",", ":")))
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("target", type=Path)
     parser.add_argument("--source", type=Path, default=Path("/opt/sqlglot"))
+    parser.add_argument("--index", action="store_true")
     opts = parser.parse_args()
-    collect(opts.source.resolve(), opts.target.resolve())
+    action = index if opts.index else collect
+    action(opts.source.resolve(), opts.target.resolve())

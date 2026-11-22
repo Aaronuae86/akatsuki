@@ -14,6 +14,21 @@ from replay import Replay
 from schedule import cost, pack
 
 
+EXECUTOR_TEST = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+
+
+def choose_query_jobs(profile, path, lines):
+    if lines.intersection(profile["parent"]["files"].get(path, ())):
+        return None
+    jobs = [i for i, job in enumerate(profile["jobs"])
+            if lines.intersection(job["files"].get(path, ()))]
+    cpu = sum(profile["jobs"][i]["cpu"] for i in jobs)
+    # CPU in the probe differs by host. Keep the replay to sparse jobs.
+    if not jobs or len(jobs) > 8 or cpu > 4:
+        return None
+    return jobs
+
+
 def verification_group(numbers, durations, cost_ms):
     if not numbers or len(numbers) > 350:
         return set()
@@ -32,7 +47,14 @@ def verification_group(numbers, durations, cost_ms):
     return set()
 
 
-def main(data, source, index_path, verify, verbose):
+def cheap_verification_group(candidates, durations, unverified):
+    if (candidates and not candidates.intersection(unverified)
+        and len(candidates) <= 5 and sum(durations[n] for n in candidates) <= 650):
+        return candidates
+    return set()
+
+
+def main(data, source, index_path, verify, verbose, executor_index=None, check_cheap=False):
     start = time.monotonic()
     tests = json.loads((data / "tests.json").read_text(encoding="utf-8"))["tests"]
     by_name = {test["id"]: test["number"] for test in tests}
@@ -43,8 +65,11 @@ def main(data, source, index_path, verify, verbose):
     index = None
     if index_path.is_file():
         index = DependencyIndex(load_index(index_path), tests)
-    replay = Replay(source) if verify else None
+    profile = json.loads(executor_index.read_bytes()) if executor_index and executor_index.is_file() else None
+    replay = Replay(source) if verify or profile or check_cheap else None
     verification_left = 48.0
+    cheap_budget = 14.0
+    unverified = {by_name[name] for name in index.unverified} if index else set()
     deadline = start + 150.0
     try:
         for patch in paths:
@@ -60,22 +85,54 @@ def main(data, source, index_path, verify, verbose):
                         candidates = {by_name[name] for name in impact.names}
                         workers = pack(candidates, durations)
                         before = cost(workers, durations)
-                        if replay and verification_left >= 1.1 and time.monotonic() < deadline:
+                        if (profile and impact.executor_lines and EXECUTOR_TEST in impact.names
+                            and EXECUTOR_TEST not in index.unverified and verification_left >= 8
+                            and deadline - time.monotonic() >= 8):
+                            executor_number = by_name[EXECUTOR_TEST]
+                            reduced = pack(candidates - {executor_number}, durations)
+                            if before - cost(reduced, durations) >= 12_000:
+                                jobs = choose_query_jobs(profile, changes[0].path, impact.executor_lines)
+                                if jobs is not None:
+                                    passed, _, spent = replay.check(
+                                        changes, {EXECUTOR_TEST}, 8, query_jobs=jobs,
+                                        query_count=len(profile["jobs"]),
+                                    )
+                                    verification_left -= spent
+                                    verify_wall += spent
+                                    if EXECUTOR_TEST in passed:
+                                        candidates.remove(executor_number)
+                                        workers = reduced
+                                        before = cost(workers, durations)
+                        if verify and verification_left >= 1.1 and time.monotonic() < deadline:
                             group = set()
                             if any(change.path.startswith("sqlglot/") and change.removed for change in changes):
                                 group = verification_group(candidates, durations, before)
-                                group -= {by_name[name] for name in index.unverified}
+                                group -= unverified
                             if group:
                                 budget = min(7.5, verification_left, deadline - time.monotonic())
                                 if budget >= 1.1:
                                     selected = {names[n] for n in group}
-                                    passed, collection_error, verify_wall = replay.check(changes, selected, budget)
-                                    verification_left -= verify_wall
+                                    passed, collection_error, spent = replay.check(changes, selected, budget)
+                                    verification_left -= spent
+                                    verify_wall += spent
                                     if collection_error:
                                         workers = all_workers
                                         reason = "verification collection error"
                                     else:
                                         workers = pack(candidates - {by_name[name] for name in passed}, durations)
+                        elif (check_cheap and cheap_budget >= 1.5 and deadline - time.monotonic() >= 1.5
+                              and all(change.path.startswith("sqlglot/") for change in changes)
+                              and cheap_verification_group(candidates, durations, unverified)):
+                            passed, collection_error, spent = replay.check(
+                                changes, {names[n] for n in candidates}, 1.5,
+                            )
+                            cheap_budget -= spent
+                            verify_wall += spent
+                            if collection_error:
+                                workers = all_workers
+                                reason = "verification collection error"
+                            elif passed:
+                                workers = pack(candidates - {by_name[name] for name in passed}, durations)
                         if verbose:
                             print(f"{patch.stem}: candidates={len(candidates)} {before/1000:.3f}s",
                                   file=sys.stderr)
@@ -101,6 +158,9 @@ if __name__ == "__main__":
     parser.add_argument("--source", type=Path, default=Path("/opt/sqlglot"))
     parser.add_argument("--index", type=Path, default=Path("/opt/dependencies.sqlite"))
     parser.add_argument("--verify", action="store_true", help="try budgeted pytest reruns")
+    parser.add_argument("--check-cheap", action="store_true", help="verify small candidate groups with pytest")
+    parser.add_argument("--executor-index", type=Path)
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
-    main(args.data.resolve(), args.source.resolve(), args.index.resolve(), args.verify, args.verbose)
+    main(args.data.resolve(), args.source.resolve(), args.index.resolve(), args.verify, args.verbose,
+         args.executor_index, args.check_cheap)

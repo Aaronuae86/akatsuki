@@ -1,6 +1,7 @@
 """Translate an applied patch and a baseline index into candidate test IDs."""
 
 import ast
+from collections import Counter
 from dataclasses import dataclass
 import json
 import symtable
@@ -21,6 +22,8 @@ TRACKED_CLASS_ATTRIBUTES = {
 IDENTITY_PAIRS = {(ast.Is, ast.Eq), (ast.IsNot, ast.NotEq)}
 ORDER = {ast.Lt: operator.lt, ast.LtE: operator.le, ast.Gt: operator.gt,
          ast.GtE: operator.ge, ast.Eq: operator.eq, ast.NotEq: operator.ne}
+REVERSED_ORDER = {ast.Lt: ast.Gt, ast.LtE: ast.GtE, ast.Gt: ast.Lt, ast.GtE: ast.LtE,
+                  ast.Eq: ast.Eq, ast.NotEq: ast.NotEq}
 UNKNOWN_OPERAND = 1 << 40
 DISPATCH_FIELD = "TRANSFORMS"
 TYPE_FIELD = "TYPE_MAPPING"
@@ -52,9 +55,19 @@ def threshold_edit(before, after):
             return False
         if isinstance(a, ast.Compare):
             x, y = integer_predicate(a) or tuple_predicate(a), integer_predicate(b) or tuple_predicate(b)
-            if x and y and type(x[1]) is type(y[1]) and x != y and shape(a.left) == shape(b.left):
-                changes.append((a, x, y))
-                return True
+            if x and len(b.ops) == 1 and type(b.ops[0]) in REVERSED_ORDER:
+                if same_tree(a.left, b.comparators[0]):
+                    # Compare the same observed native value even when the
+                    # patched source places its literal on the left.
+                    swapped = ast.Compare(left=b.comparators[0], ops=[REVERSED_ORDER[type(b.ops[0])]()],
+                                          comparators=[b.left])
+                    reversed_bound = integer_predicate(swapped) or tuple_predicate(swapped)
+                    if reversed_bound and type(x[1]) is type(reversed_bound[1]) and not same_tree(a, b):
+                        changes.append((a, x, reversed_bound))
+                        return True
+                if y and type(x[1]) is type(y[1]) and x != y and same_tree(a.left, b.left):
+                    changes.append((a, x, y))
+                    return True
         if isinstance(a, ast.AST):
             return all(match(getattr(a, f), getattr(b, f)) for f in a._fields)
         if isinstance(a, list):
@@ -69,6 +82,7 @@ def threshold_edit(before, after):
 class Impact:
     names: set[str]
     fallback: str = ""
+    executor_lines: set[int] | None = None
 
 
 def tree_signature(table):
@@ -169,6 +183,20 @@ def changed_literals(old, new):
                 return []
             changed.append(left.value)
     return changed
+
+
+def changed_boolean_keys(old, new):
+    if not isinstance(old, ast.Dict) or not isinstance(new, ast.Dict) or data_shape(old) != data_shape(new):
+        return set()
+    keys = set()
+    for key, before, after in zip(old.keys, old.values, new.values):
+        if same_tree(before, after):
+            continue
+        if not (isinstance(key, ast.Constant) and type(key.value) is str and isinstance(before, ast.Constant)
+                and isinstance(after, ast.Constant) and type(before.value) is type(after.value) is bool):
+            return set()
+        keys.add(key.value)
+    return keys
 
 
 def deleted_dispatch_entries(old, new):
@@ -332,6 +360,38 @@ def guard_site(path, node):
     return f"@guard/{path}/{node.lineno}:{node.col_offset}"
 
 
+def predicate_only(before, after):
+    """Recognize one conditional change with the same executable statements."""
+    changes = 0
+
+    def match(left, right):
+        nonlocal changes
+        if type(left) is not type(right):
+            return False
+        if isinstance(left, ast.If) and not same_tree(left.test, right.test):
+            # The new predicate may negate an existing expression or change
+            # an operator on the same operands, without adding a call.
+            a, b = left.test, right.test
+            negated = (
+                isinstance(b, ast.UnaryOp) and isinstance(b.op, ast.Not) and same_tree(a, b.operand)
+                or isinstance(a, ast.UnaryOp) and isinstance(a.op, ast.Not) and same_tree(a.operand, b)
+            )
+            compared = (isinstance(a, ast.Compare) and isinstance(b, ast.Compare)
+                        and len(a.ops) == len(b.ops) == 1
+                        and same_tree(a.left, b.left) and same_tree(a.comparators, b.comparators))
+            if not (negated or compared):
+                return False
+            changes += 1
+            return match(left.body, right.body) and match(left.orelse, right.orelse)
+        if isinstance(left, ast.AST):
+            return all(match(getattr(left, key), getattr(right, key)) for key in left._fields)
+        if isinstance(left, list):
+            return len(left) == len(right) and all(match(a, b) for a, b in zip(left, right))
+        return left == right
+
+    return match(before, after) and changes == 1
+
+
 @dataclass(frozen=True)
 class GuardEdit:
     anchor: ast.expr
@@ -416,6 +476,8 @@ class DependencyIndex:
         self.map_fields = set(index.get("map_fields", []))
         self.call_coverage = index.get("call_coverage", False)
         self.function_calls = index.get("function_calls", False)
+        self.required_key_coverage = index.get("required_key_coverage", False)
+        self.scoped_type_map = index.get("scoped_type_map", False)
         self.dispatch_exports = set(index.get("dispatch_exports", ()))
         self.dispatch_modules = set(index.get("dispatch_modules", ()))
         self.dtype_names = index.get("dtype_names", {})
@@ -442,10 +504,25 @@ class DependencyIndex:
     def fallback(self, reason):
         return Impact(set(self.names), reason)
 
+    def copied_config_consumers(self, tag):
+        tags = {tag}
+        pending = [tag]
+        while pending:
+            current = pending.pop()
+            if self.files.get("@eager/" + current):
+                return None
+            for targets in self.files.get("@dispatch-copy/" + current, {}).values():
+                for target in targets:
+                    if target not in tags:
+                        tags.add(target)
+                        pending.append(target)
+        return tags
+
     def candidates(self, changes):
         if self.unknown:
             return self.fallback("judge inventory differs from index")
         result = set(self.unverified)
+        executor_lines = None
         for change in changes:
             path = change.path
             if change.original is None or change.updated is None:
@@ -525,6 +602,7 @@ class DependencyIndex:
                     or (binding_change and not self.function_calls)):
                     return self.fallback(f"changed Python bindings {path}")
                 for before, after in functions:
+                    affected_lines = entry_lines or code_ranges(change, before, after)
                     scope = {
                         scope: lines for scope, lines in dependencies.items()
                         if not (scope in observed and 2 not in observed[scope])
@@ -543,13 +621,17 @@ class DependencyIndex:
                         calls = self.files.get(f"@lambda/{path}", {})
                         if not self.add(result, calls, {before.lineno}):
                             return self.fallback(f"lambda executed during collection {path}")
-                    elif not self.add(result, scope, entry_lines or code_ranges(change, before, after)):
+                    elif not self.add(result, scope, affected_lines):
                         return self.fallback(f"runtime code called during collection {path}")
+                    elif (len(changes) == len(functions) == 1 and not assignments
+                          and path.startswith("sqlglot/optimizer/") and isinstance(affected_lines, set)
+                          and predicate_only(before, after)):
+                        executor_lines = affected_lines
             for owner, field, old_value, new_value in assignments:
                 module = path.removesuffix(".py").replace("/", ".")
                 if not self.add_assignment(result, module, owner, field, old_value, new_value, path, isolated_assignment):
                     return self.fallback(f"unresolved class configuration {path}:{owner}.{field}")
-        return Impact(result)
+        return Impact(result, executor_lines=executor_lines)
 
     def add_assignment(self, result, module, owner, field, old_value, new_value, path, isolated_assignment):
         if not self.observed_attributes:
@@ -567,6 +649,15 @@ class DependencyIndex:
             names = {self.dtype_names[key] for key in keys}
             if any(self.files.get("@type-map/eager/key/" + name) for name in names):
                 return False
+            if self.scoped_type_map:
+                tags = self.copied_config_consumers(f"@attr/{module}/{owner}/{field}")
+                if tags is None or not self.add(result, self.files.get("@type-map/unbound", {})):
+                    return False
+                return all(
+                    self.add(result, self.files.get(tag, {}))
+                    and all(self.add(result, self.files.get(f"{tag}/key/{name}", {})) for name in names)
+                    for tag in tags
+                )
             if not self.add(result, self.files.get("@type-map/whole", {})):
                 return False
             return all(self.add(result, self.files.get("@type-map/key/" + name, {})) for name in names)
@@ -577,17 +668,9 @@ class DependencyIndex:
             tag = f"@attr/{module}/{owner}/{field}"
             if not isolated_assignment or module not in self.dispatch_modules:
                 return False
-            tags = {tag}
-            pending = [tag]
-            while pending:
-                current = pending.pop()
-                if self.files.get("@eager/" + current):
-                    return False
-                for targets in self.files.get("@dispatch-copy/" + current, {}).values():
-                    for target in targets:
-                        if target not in tags:
-                            tags.add(target)
-                            pending.append(target)
+            tags = self.copied_config_consumers(tag)
+            if tags is None:
+                return False
             for key, value in deleted_dispatch_entries(old_value, new_value):
                 if key not in self.dispatch_exports:
                     return False
@@ -608,6 +691,8 @@ class DependencyIndex:
                     return False
             return all(self.add(result, self.files.get(dest, {})) for dest in tags)
         keys = [field, "required_args"] if field == "arg_types" else [field]
+        missing = (changed_boolean_keys(old_value, new_value)
+                   if field == "arg_types" and isolated_assignment and self.required_key_coverage else set())
         for key in keys:
             tag = f"@attr/{module}/{owner}/{key}"
             if self.files.get("@eager/" + tag):
@@ -645,6 +730,23 @@ class DependencyIndex:
                     test: [line for line in lines if line != 2]
                     for test, lines in uses.items()
                 }
+            if key == "required_args" and self.required_key_coverage:
+                prefix = tag + "/missing/"
+                reads = (self.files.get(prefix + arg, {}) for arg in missing) if missing else (
+                    self.files.get(site, {}) for site in self.files if site.startswith(prefix)
+                )
+                if not all(self.add(result, observed) for observed in reads):
+                    return False
+                if missing:
+                    # Changing a set of required keys can reorder existing errors.
+                    # Multiple absent required keys in a scope may occur together.
+                    possible_errors = Counter()
+                    for node, value in zip(old_value.keys, old_value.values):
+                        if (isinstance(node, ast.Constant) and type(node.value) is str
+                            and not (isinstance(value, ast.Constant) and value.value is False)):
+                            possible_errors.update(self.files.get(prefix + node.value, {}).keys())
+                    if not self.add(result, {scope: [0] for scope, count in possible_errors.items() if count > 1}):
+                        return False
             if not self.add(result, uses, {0}):
                 return False
         return True
